@@ -46,8 +46,7 @@ fn main() {
          ###            ECHOING FIREFOX-LIKE VPIO TEST            ###\n\
          ############################################################\n\
          # This test creates a VPIO unit, starts it and waits 10    #\n\
-         # seconds while while dumping the input (and silent        #\n\
-         # output) to a file.                                       #\n\
+         # seconds while while dumping the input to a file.         #\n\
          # It should cancel echo, but for some reason does not, on  #\n\
          # macOS 14.                                                #\n\
          # Play some audio on the machine to test while waiting!    #\n\
@@ -84,7 +83,7 @@ fn main() {
             ptr::null_mut(),                 // Default input device.
             &mut params,                     // Input params.
             ptr::null_mut(),                 // Default output device.
-            &mut params,                     // Output params.
+            ptr::null_mut(),                 // Don't set up output.
             512,                             // Latency in frames.
             Some(noop_data_callback),        // Data callback.
             Some(noop_state_callback),       // State Callback.
@@ -101,7 +100,7 @@ fn main() {
             ptr::null_mut(),                 // Default input device.
             &mut params,                     // Input params.
             ptr::null_mut(),                 // Default output device.
-            &mut params,                     // Output params.
+            ptr::null_mut(),                 // Don't set up output.
             512,                             // Latency in frames.
             Some(noop_data_callback),        // Data callback.
             Some(noop_state_callback),       // State Callback.
