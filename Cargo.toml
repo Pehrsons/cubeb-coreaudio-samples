@@ -1,0 +1,11 @@
+[package]
+name = "cubeb-coreaudio-samples"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cubeb-backend = "0.13"
+cubeb-coreaudio = { git = "https://github.com/mozilla/cubeb-coreaudio-rs", rev = "d892b0a00cbde15a5a9b1ee34e7f1064fc7e4b9a", features = ["audio-dump"] }
+
+[build-dependencies]
+cc = "1.0"
