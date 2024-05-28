@@ -60,6 +60,9 @@ struct Args {
     /// Include available stream formats when traversing. Lists of available formats can be quite verbose.
     #[clap(long, short = 'f', action)]
     include_formats: bool,
+    /// Include device channels when traversing. Lists of channel descriptions can be quite verbose.
+    #[clap(long, short = 'n', action)]
+    include_channels: bool,
     /// Include controls when traversing. They are often plenty and therefore quite verbose.
     #[clap(long, short = 'c', action)]
     include_controls: bool,
@@ -69,6 +72,9 @@ struct Args {
     /// Include processes when traversing.
     #[clap(long, short = 'p', action)]
     include_processes: bool,
+    /// Debug mode. Show all errors for getters that failed.
+    #[clap(long, short = 'd', action)]
+    debug: bool,
     /// Set up a VoiceProcessingIO unit before traversing, to see what streams and channels it adds.
     #[clap(long, short = 'v', action)]
     use_vpio: bool,
@@ -127,6 +133,9 @@ fn main() {
     if args.include_formats {
         opt.insert(TraversalOptions::INCLUDE_FORMATS);
     }
+    if args.include_channels {
+        opt.insert(TraversalOptions::INCLUDE_CHANNELS);
+    }
     if args.include_controls {
         opt.insert(TraversalOptions::INCLUDE_CONTROLS);
     }
@@ -138,6 +147,10 @@ fn main() {
     }
     if args.include_all {
         opt = TraversalOptions::all();
+        opt.remove(TraversalOptions::DEBUG);
+    }
+    if args.debug {
+        opt.insert(TraversalOptions::DEBUG);
     }
 
     if args.wait {

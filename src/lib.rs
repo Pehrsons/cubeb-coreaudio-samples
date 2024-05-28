@@ -8,29 +8,31 @@ use std::os::raw::c_void;
 use std::ptr;
 
 #[derive(Debug)]
-pub struct StringRef(CFStringRef);
+struct StringRef(CFStringRef);
+
+#[allow(dead_code)]
 impl StringRef {
-    pub fn new(string_ref: CFStringRef) -> Self {
+    fn new(string_ref: CFStringRef) -> Self {
         assert!(!string_ref.is_null());
         Self(string_ref)
     }
 
-    pub fn into_string(self) -> String {
+    fn into_string(self) -> String {
         self.to_string()
     }
 
-    pub fn to_cstring(&self) -> CString {
+    fn to_cstring(&self) -> CString {
         unsafe {
             // Assume that bytes doesn't contain `0` in the middle.
             CString::from_vec_unchecked(utf8_from_cfstringref(self.0))
         }
     }
 
-    pub fn into_cstring(self) -> CString {
+    fn into_cstring(self) -> CString {
         self.to_cstring()
     }
 
-    pub fn get_raw(&self) -> CFStringRef {
+    fn get_raw(&self) -> CFStringRef {
         self.0
     }
 }
@@ -167,10 +169,23 @@ pub fn audio_object_get_property_data_size_with_qualifier<Q>(
     }
 }
 
-fn get_property<T: Default>(obj: AudioObjectID, selector: u32) -> Result<T, OSStatus> {
+pub fn has_property_scoped(obj: AudioObjectID, selector: u32, scope: u32) -> bool {
     let address = AudioObjectPropertyAddress {
         mSelector: selector,
-        mScope: kAudioObjectPropertyScopeGlobal,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+    audio_object_has_property(obj, &address)
+}
+
+pub fn get_property_scoped<T: Default>(
+    obj: AudioObjectID,
+    selector: u32,
+    scope: u32,
+) -> Result<T, OSStatus> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMaster,
     };
     let mut value: T = T::default();
@@ -182,7 +197,11 @@ fn get_property<T: Default>(obj: AudioObjectID, selector: u32) -> Result<T, OSSt
     }
 }
 
-fn get_list_property_scoped<T: Clone + Default>(
+pub fn get_property<T: Default>(obj: AudioObjectID, selector: u32) -> Result<T, OSStatus> {
+    get_property_scoped(obj, selector, kAudioObjectPropertyScopeGlobal)
+}
+
+pub fn get_list_property_scoped<T: Clone + Default>(
     obj: AudioObjectID,
     selector: u32,
     scope: u32,
@@ -205,14 +224,14 @@ fn get_list_property_scoped<T: Clone + Default>(
     }
 }
 
-fn get_list_property<T: Clone + Default>(
+pub fn get_list_property<T: Clone + Default>(
     obj: AudioObjectID,
     selector: u32,
 ) -> Result<Vec<T>, OSStatus> {
     get_list_property_scoped(obj, selector, kAudioObjectPropertyScopeGlobal)
 }
 
-fn get_string_property(obj: AudioObjectID, selector: u32) -> Result<String, OSStatus> {
+pub fn get_string_property(obj: AudioObjectID, selector: u32) -> Result<String, OSStatus> {
     let address = AudioObjectPropertyAddress {
         mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -222,7 +241,7 @@ fn get_string_property(obj: AudioObjectID, selector: u32) -> Result<String, OSSt
     let mut size = mem::size_of_val(&str);
     let status = audio_object_get_property_data(obj, &address, &mut size, &mut str);
     match status {
-        0 => Ok(StringRef::new(str).to_string()),
+        0 => Ok(StringRef::new(str).into_string()),
         e => Err(e),
     }
 }
@@ -294,148 +313,242 @@ fn add_class_id(identifier: &str, id: Result<AudioClassID, OSStatus>) {
     );
 }
 
-pub fn traverse_aggregate_device(obj: AudioObjectID) {
-    if let Ok(arr) = get_property::<usize>(obj, kAudioAggregateDevicePropertyTapList) {
-        let arr = arr as CFArrayRef;
-        if !arr.is_null() {
-            add_leaf!("TapList count: {}", unsafe { CFArrayGetCount(arr) });
+macro_rules! prop {
+    (@print $name: expr, $value: expr) => {
+        add_leaf!("{}: {:?}", $name, $value);
+    };
+    (@print @pretty $pretty: expr, $name: expr, $value: expr) => {
+        add_leaf!("{}: {:#?}", $name, $value);
+    };
+    (@internal $fun: expr $(, @pretty $pretty: expr)? $(, @prefix $prefix: expr)?, ($obj: expr, $prop: expr $(, $args: expr),*), $opt: expr $(, $map: expr)?) => {
+        let r = $fun($obj, $prop, $($args),*)$(.map($map))?;
+        let name = stringify!($prop).split("Property").last().unwrap();
+        $(let name = format!("{} {}", stringify!($prefix), name);)?
+        if $opt.contains(TraversalOptions::DEBUG) {
+            prop!(@print $(@pretty $pretty,)? name, r);
+        } else if let Ok(p) = r {
+            prop!(@print $(@pretty $pretty,)? name, p);
         }
+    };
+    (bool, Input, $prop: expr, $obj: expr, $opt: expr) => {
+        prop!(@internal get_property_scoped::<u32>, @prefix Input, ($obj, $prop, kAudioObjectPropertyScopeInput), $opt, |p| p != 0);
+    };
+    (bool, Output, $prop: expr, $obj: expr, $opt: expr) => {
+        prop!(@internal get_property_scoped::<u32>, @prefix Output, ($obj, $prop, kAudioObjectPropertyScopeOutput), $opt, |p| p != 0);
+    };
+    (bool, $prop: expr, $obj: expr, $opt: expr) => {
+        prop!(@internal get_property::<u32>, ($obj, $prop), $opt, |p| p != 0);
+    };
+    (string, $prop: expr, $obj: expr, $opt: expr) => {
+        prop!(@internal get_string_property, ($obj, $prop), $opt);
+    };
+    (Vec<$t: ty>, Input, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_list_property_scoped::<$t>, @prefix Input, ($obj, $prop, kAudioObjectPropertyScopeInput), $opt$(, $map)?);
+    };
+    (Vec<$t: ty>, Output, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_list_property_scoped::<$t>, @prefix Output, ($obj, $prop, kAudioObjectPropertyScopeOutput), $opt$(, $map)?);
+    };
+    (Vec<$t: ty>, Pretty, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_list_property::<$t>, @pretty "", ($obj, $prop), $opt$(, $map)?);
+    };
+    (Vec<$t: ty>, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_list_property::<$t>, ($obj, $prop), $opt$(, $map)?);
+    };
+    ($t: ty, Pretty, Input, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_property_scoped::<$t>, @pretty "", @prefix Input, ($obj, $prop, kAudioObjectPropertyScopeInput), $opt$(, $map)?);
+    };
+    ($t: ty, Pretty, Output, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_property_scoped::<$t>, @pretty "", @prefix Output, ($obj, $prop, kAudioObjectPropertyScopeOutput), $opt$(, $map)?);
+    };
+    ($t: ty, Input, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_property_scoped::<$t>, @prefix Input, ($obj, $prop, kAudioObjectPropertyScopeInput), $opt$(, $map)?);
+    };
+    ($t: ty, Output, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_property_scoped::<$t>, @prefix Output, ($obj, $prop, kAudioObjectPropertyScopeOutput), $opt$(, $map)?);
+    };
+    ($t: ty, Pretty, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_property::<$t>, @pretty "", ($obj, $prop), $opt$(, $map)?);
+    };
+    ($t: ty, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_property::<$t>, ($obj, $prop), $opt$(, $map)?);
+    };
+}
+
+fn cfarray_get_count(r: usize) -> usize {
+    let arr = r as CFArrayRef;
+    if arr.is_null() {
+        return 0;
     }
-    if let Ok(arr) = get_property::<usize>(obj, kAudioAggregateDevicePropertySubTapList) {
-        let arr = arr as CFArrayRef;
-        if !arr.is_null() {
-            add_leaf!("SubTapList count: {}", unsafe { CFArrayGetCount(arr) });
-        }
+    unsafe { CFArrayGetCount(arr) as usize }
+}
+
+fn traverse_aggregate_device(obj: AudioObjectID, opt: TraversalOptions) {
+    prop!(
+        usize,
+        kAudioAggregateDevicePropertyTapList,
+        obj,
+        opt,
+        cfarray_get_count
+    );
+    prop!(
+        usize,
+        kAudioAggregateDevicePropertySubTapList,
+        obj,
+        opt,
+        cfarray_get_count
+    );
+}
+
+fn transporttype_to_str(p: u32) -> &'static str {
+    #[allow(non_upper_case_globals)]
+    match p {
+        kAudioDeviceTransportTypeUnknown => "Unknown",
+        kAudioDeviceTransportTypeBuiltIn => "BuiltIn",
+        kAudioDeviceTransportTypeAggregate => "Aggregate",
+        kAudioDeviceTransportTypeVirtual => "Virtual",
+        kAudioDeviceTransportTypePCI => "PCI",
+        kAudioDeviceTransportTypeUSB => "USB",
+        kAudioDeviceTransportTypeFireWire => "FireWire",
+        kAudioDeviceTransportTypeBluetooth => "Bluetooth",
+        kAudioDeviceTransportTypeBluetoothLE => "BluetoothLE",
+        kAudioDeviceTransportTypeHDMI => "HDMI",
+        kAudioDeviceTransportTypeDisplayPort => "DisplayPort",
+        kAudioDeviceTransportTypeAirPlay => "AirPlay",
+        kAudioDeviceTransportTypeAVB => "AVB",
+        kAudioDeviceTransportTypeThunderbolt => "Thunderbolt",
+        kAudioDeviceTransportTypeContinuityCaptureWired => "ContinuityCaptureWired",
+        kAudioDeviceTransportTypeContinuityCaptureWireless => "ContinuityCaptureWireless",
+        kAudioDeviceTransportTypeContinuityCapture => "ContinuityCapture",
+        _ => "Unexpected TransportType",
     }
 }
 
-pub fn traverse_device(obj: AudioObjectID, opt: TraversalOptions) {
-    if let Ok(s) = get_string_property(obj, kAudioDevicePropertyConfigurationApplication) {
-        add_leaf!("ConfigurationApplication: {}", s);
-    }
-    if let Ok(s) = get_string_property(obj, kAudioDevicePropertyDeviceUID) {
-        add_leaf!("DeviceUID: {}", s);
-    }
-    if let Ok(s) = get_string_property(obj, kAudioDevicePropertyModelUID) {
-        add_leaf!("ModelUID: {}", s);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyTransportType) {
-        #[allow(non_upper_case_globals)]
-        let s = match p {
-            kAudioDeviceTransportTypeUnknown => "Unknown",
-            kAudioDeviceTransportTypeBuiltIn => "BuiltIn",
-            kAudioDeviceTransportTypeAggregate => "Aggregate",
-            kAudioDeviceTransportTypeVirtual => "Virtual",
-            kAudioDeviceTransportTypePCI => "PCI",
-            kAudioDeviceTransportTypeUSB => "USB",
-            kAudioDeviceTransportTypeFireWire => "FireWire",
-            kAudioDeviceTransportTypeBluetooth => "Bluetooth",
-            kAudioDeviceTransportTypeBluetoothLE => "BluetoothLE",
-            kAudioDeviceTransportTypeHDMI => "HDMI",
-            kAudioDeviceTransportTypeDisplayPort => "DisplayPort",
-            kAudioDeviceTransportTypeAirPlay => "AirPlay",
-            kAudioDeviceTransportTypeAVB => "AVB",
-            kAudioDeviceTransportTypeThunderbolt => "Thunderbolt",
-            kAudioDeviceTransportTypeContinuityCaptureWired => "ContinuityCaptureWired",
-            kAudioDeviceTransportTypeContinuityCaptureWireless => "ContinuityCaptureWireless",
-            kAudioDeviceTransportTypeContinuityCapture => "ContinuityCapture",
-            _ => "Unexpected TransportType",
-        };
-        add_leaf!("TransportType: {}", s);
-    }
-    if let Ok(p) = get_property::<pid_t>(obj, kAudioDevicePropertyHogMode) {
-        add_leaf!("HogMode: {}", p);
-    }
-    if let Ok(objects) = get_list_property::<AudioDeviceID>(obj, kAudioDevicePropertyRelatedDevices)
-    {
-        add_leaf!("RelatedDevices: {:?}", objects);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyClockDomain) {
-        add_leaf!("ClockDomain: {}", p);
-    }
-    if let Ok(p) = get_string_property(obj, kAudioDevicePropertyClockDevice) {
-        add_leaf!("ClockDevice: {:?}", p);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyDeviceIsAlive) {
-        add_leaf!("DeviceIsAlive: {}", p == 1)
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyDeviceIsRunningSomewhere) {
-        add_leaf!("DeviceIsRunningSomewhere: {}", p == 1);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyDeviceIsRunning) {
-        add_leaf!("DeviceIsRunning: {}", p == 1)
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyDeviceCanBeDefaultDevice) {
-        add_leaf!("DeviceCanBeDefaultDevice: {}", p == 1)
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyDeviceCanBeDefaultSystemDevice) {
-        add_leaf!("DeviceCanBeDefaultSystemDevice: {}", p == 1)
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyLatency) {
-        add_leaf!("Latency: {}", p)
-    }
-    if let Ok(objects) = get_list_property_scoped::<AudioStreamID>(
+fn traverse_device(obj: AudioObjectID, opt: TraversalOptions) {
+    prop!(
+        string,
+        kAudioDevicePropertyConfigurationApplication,
         obj,
-        kAudioDevicePropertyStreams,
-        kAudioObjectPropertyScopeInput,
-    ) {
-        add_leaf!("Input Streams: {:?}", objects);
-    }
-    if let Ok(objects) = get_list_property_scoped::<AudioStreamID>(
+        opt
+    );
+    prop!(string, kAudioDevicePropertyDeviceUID, obj, opt);
+    prop!(string, kAudioDevicePropertyModelUID, obj, opt);
+    prop!(
+        u32,
+        kAudioDevicePropertyTransportType,
         obj,
+        opt,
+        transporttype_to_str
+    );
+    prop!(pid_t, kAudioDevicePropertyHogMode, obj, opt);
+    prop!(
+        Vec<AudioDeviceID>,
+        kAudioDevicePropertyRelatedDevices,
+        obj,
+        opt
+    );
+    prop!(u32, kAudioDevicePropertyClockDomain, obj, opt);
+    prop!(string, kAudioDevicePropertyClockDevice, obj, opt);
+    prop!(bool, kAudioDevicePropertyDeviceIsAlive, obj, opt);
+    prop!(bool, kAudioDevicePropertyDeviceIsRunningSomewhere, obj, opt);
+    prop!(bool, kAudioDevicePropertyDeviceIsRunning, obj, opt);
+    prop!(
+        bool,
+        Input,
+        kAudioDevicePropertyDeviceCanBeDefaultDevice,
+        obj,
+        opt
+    );
+    prop!(
+        bool,
+        Output,
+        kAudioDevicePropertyDeviceCanBeDefaultDevice,
+        obj,
+        opt
+    );
+    prop!(
+        bool,
+        Output,
+        kAudioDevicePropertyDeviceCanBeDefaultSystemDevice,
+        obj,
+        opt
+    );
+    prop!(u32, Input, kAudioDevicePropertyLatency, obj, opt);
+    prop!(u32, Output, kAudioDevicePropertyLatency, obj, opt);
+    prop!(
+        Vec<AudioStreamID>,
+        Input,
         kAudioDevicePropertyStreams,
-        kAudioObjectPropertyScopeOutput,
-    ) {
-        add_leaf!("Output Streams: {:?}", objects);
-    }
-    if let Ok(objects) = get_list_property::<AudioObjectID>(obj, kAudioObjectPropertyControlList) {
-        add_leaf!("Controls: {:?}", objects);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertySafetyOffset) {
-        add_leaf!("SafetyOffset: {}", p)
-    }
-    if let Ok(p) = get_property::<f64>(obj, kAudioDevicePropertyActualSampleRate) {
-        add_leaf!("ActualSampleRate: {}", p);
-    }
-    if let Ok(p) = get_property::<f64>(obj, kAudioDevicePropertyNominalSampleRate) {
-        add_leaf!("NominalSampleRate: {}", p)
-    }
+        obj,
+        opt
+    );
+    prop!(
+        Vec<AudioStreamID>,
+        Output,
+        kAudioDevicePropertyStreams,
+        obj,
+        opt
+    );
+    prop!(
+        Vec<AudioObjectID>,
+        kAudioObjectPropertyControlList,
+        obj,
+        opt
+    );
+    prop!(u32, Input, kAudioDevicePropertySafetyOffset, obj, opt);
+    prop!(u32, Output, kAudioDevicePropertySafetyOffset, obj, opt);
+    prop!(f64, kAudioDevicePropertyActualSampleRate, obj, opt);
+    prop!(f64, kAudioDevicePropertyNominalSampleRate, obj, opt);
     if opt.contains(TraversalOptions::INCLUDE_FORMATS) {
-        if let Ok(objects) = get_list_property::<AudioValueRange>(
-            obj,
+        prop!(
+            Vec<AudioValueRange>,
+            Pretty,
             kAudioDevicePropertyAvailableNominalSampleRates,
-        ) {
-            add_leaf!("AvailableNominalSampleRates: {:#?}", objects);
-        }
+            obj,
+            opt
+        );
     }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyBufferFrameSize) {
-        add_leaf!("BufferFrameSize: {}", p);
+    prop!(u32, kAudioDevicePropertyBufferFrameSize, obj, opt);
+    prop!(
+        AudioValueRange,
+        kAudioDevicePropertyBufferFrameSizeRange,
+        obj,
+        opt
+    );
+    prop!(
+        u32,
+        kAudioDevicePropertyUsesVariableBufferFrameSizes,
+        obj,
+        opt
+    );
+    prop!(
+        Vec<u32>,
+        Input,
+        kAudioDevicePropertyPreferredChannelsForStereo,
+        obj,
+        opt
+    );
+    prop!(
+        Vec<u32>,
+        Output,
+        kAudioDevicePropertyPreferredChannelsForStereo,
+        obj,
+        opt
+    );
+    if opt.contains(TraversalOptions::INCLUDE_CHANNELS) {
+        prop!(
+            AudioChannelLayout,
+            Pretty,
+            Output,
+            kAudioDevicePropertyPreferredChannelLayout,
+            obj,
+            opt
+        );
     }
-    if let Ok(p) = get_property::<AudioValueRange>(obj, kAudioDevicePropertyBufferFrameSizeRange) {
-        add_leaf!("BufferFrameSizeRange: {:?}", p);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyUsesVariableBufferFrameSizes) {
-        add_leaf!("UsesVariableBufferFrameSizes: {:?}", p == 1);
-    }
-    if let Ok(objects) =
-        get_list_property::<u32>(obj, kAudioDevicePropertyPreferredChannelsForStereo)
-    {
-        add_leaf!("PreferredChannelsForStereo: {:?}", objects);
-    }
-    if let Ok(p) =
-        get_property::<AudioChannelLayout>(obj, kAudioDevicePropertyPreferredChannelLayout)
-    {
-        add_leaf!("PreferredChannelLayout: {:?}", p);
-    }
-    if let Ok(p) = get_property::<f32>(obj, kAudioDevicePropertyIOCycleUsage) {
-        add_leaf!("IOCycleUsage: {}", p);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioDevicePropertyProcessMute) {
-        add_leaf!("ProcessMute: {}", p != 0);
-    }
+    prop!(f32, kAudioDevicePropertyIOCycleUsage, obj, opt);
+    prop!(u32, Input, kAudioDevicePropertyProcessMute, obj, opt);
 }
 
-pub fn terminaltype_to_str(t: u32) -> String {
+fn terminaltype_to_str(t: u32) -> String {
     #[allow(non_upper_case_globals)]
     match t {
         kAudioStreamTerminalTypeUnknown => "Unknown".to_string(),
@@ -455,175 +568,151 @@ pub fn terminaltype_to_str(t: u32) -> String {
     }
 }
 
-pub fn traverse_stream(obj: AudioStreamID, opt: TraversalOptions) {
-    if let Ok(p) = get_property::<u32>(obj, kAudioStreamPropertyIsActive) {
-        add_leaf!("IsActive: {}", p == 1);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioStreamPropertyDirection) {
-        add_leaf!("Direction: {}", if p == 1 { "Input" } else { "Output" });
-    }
-    if let Ok(p) =
-        get_property::<u32>(obj, kAudioStreamPropertyTerminalType).map(|p| terminaltype_to_str(p))
-    {
-        add_leaf!("TerminalType: {}", p);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioStreamPropertyStartingChannel) {
-        add_leaf!("StartingChannel: {}", p);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioStreamPropertyLatency) {
-        add_leaf!("Latency: {}", p);
-    }
-    if let Ok(p) =
-        get_property::<AudioStreamBasicDescription>(obj, kAudioStreamPropertyVirtualFormat)
-    {
-        add_leaf!("VirtualFormat: {:#?}", p);
-    }
+fn traverse_stream(obj: AudioStreamID, opt: TraversalOptions) {
+    prop!(bool, kAudioStreamPropertyIsActive, obj, opt);
+    prop!(
+        u32,
+        kAudioStreamPropertyDirection,
+        obj,
+        opt,
+        |p| if p == 1 { "Input" } else { "Output" }
+    );
+    prop!(
+        u32,
+        kAudioStreamPropertyTerminalType,
+        obj,
+        opt,
+        terminaltype_to_str
+    );
+    prop!(u32, kAudioStreamPropertyStartingChannel, obj, opt);
+    prop!(u32, Input, kAudioStreamPropertyLatency, obj, opt);
+    prop!(u32, Output, kAudioStreamPropertyLatency, obj, opt);
+    prop!(
+        AudioStreamBasicDescription,
+        Pretty,
+        kAudioStreamPropertyVirtualFormat,
+        obj,
+        opt
+    );
     if opt.contains(TraversalOptions::INCLUDE_FORMATS) {
-        if let Ok(p) = get_list_property::<AudioStreamRangedDescription>(
-            obj,
+        prop!(
+            Vec<AudioStreamRangedDescription>,
+            Pretty,
             kAudioStreamPropertyAvailableVirtualFormats,
-        ) {
-            add_leaf!("AvailableVirtualFormats: {:#?}", p);
-        }
-    }
-    if let Ok(p) =
-        get_property::<AudioStreamBasicDescription>(obj, kAudioStreamPropertyPhysicalFormat)
-    {
-        add_leaf!("PhysicalFormat: {:#?}", p);
-    }
-    if opt.contains(TraversalOptions::INCLUDE_FORMATS) {
-        if let Ok(p) = get_list_property::<AudioStreamRangedDescription>(
             obj,
+            opt
+        );
+    }
+    prop!(
+        AudioStreamBasicDescription,
+        Pretty,
+        kAudioStreamPropertyPhysicalFormat,
+        obj,
+        opt
+    );
+    if opt.contains(TraversalOptions::INCLUDE_FORMATS) {
+        prop!(
+            Vec<AudioStreamRangedDescription>,
+            Pretty,
             kAudioStreamPropertyAvailablePhysicalFormats,
-        ) {
-            add_leaf!("AvailablePhysicalFormats: {:#?}", p);
-        }
+            obj,
+            opt
+        );
     }
 }
 
-pub fn traverse_process(obj: AudioObjectID) {
-    if let Ok(p) = get_property::<pid_t>(obj, kAudioProcessPropertyPID) {
-        add_leaf!("PID: {}", p);
-    }
-    if let Ok(p) = get_string_property(obj, kAudioProcessPropertyBundleID) {
-        add_leaf!("BundleID: {}", p);
-    }
-    if let Ok(p) = get_list_property_scoped::<AudioObjectID>(
-        obj,
+fn traverse_process(obj: AudioObjectID, opt: TraversalOptions) {
+    prop!(pid_t, kAudioProcessPropertyPID, obj, opt);
+    prop!(string, kAudioProcessPropertyBundleID, obj, opt);
+    prop!(
+        Vec<AudioObjectID>,
+        Input,
         kAudioProcessPropertyDevices,
-        kAudioObjectPropertyScopeInput,
-    ) {
-        add_leaf!("Input Devices: {:?}", p);
-    }
-    if let Ok(p) = get_list_property_scoped::<AudioObjectID>(
         obj,
+        opt
+    );
+    prop!(
+        Vec<AudioObjectID>,
+        Output,
         kAudioProcessPropertyDevices,
-        kAudioObjectPropertyScopeOutput,
-    ) {
-        add_leaf!("Output Devices: {:?}", p);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioProcessPropertyIsRunning) {
-        add_leaf!("IsRunning: {:?}", p == 1);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioProcessPropertyIsRunningInput) {
-        add_leaf!("IsRunningInput: {:?}", p == 1);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioProcessPropertyIsRunningOutput) {
-        add_leaf!("IsRunningOutput: {:?}", p == 1);
-    }
+        obj,
+        opt
+    );
+    prop!(bool, kAudioProcessPropertyIsRunning, obj, opt);
+    prop!(bool, kAudioProcessPropertyIsRunningInput, obj, opt);
+    prop!(bool, kAudioProcessPropertyIsRunningOutput, obj, opt);
 }
 
-pub fn traverse_hw(obj: AudioObjectID) {
-    if let Ok(p) = get_list_property::<AudioObjectID>(obj, kAudioHardwarePropertyDevices) {
-        add_leaf!("Devices: {:?}", p);
-    }
-    if let Ok(p) = get_property::<AudioObjectID>(obj, kAudioHardwarePropertyDefaultInputDevice) {
-        add_leaf!("DefaultInputDevice: {}", p);
-    }
-    if let Ok(p) = get_property::<AudioObjectID>(obj, kAudioHardwarePropertyDefaultOutputDevice) {
-        add_leaf!("DefaultOutputDevice: {}", p);
-    }
-    if let Ok(p) =
-        get_property::<AudioObjectID>(obj, kAudioHardwarePropertyDefaultSystemOutputDevice)
-    {
-        add_leaf!("DefaultSystemOutputDevice: {}", p);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioHardwarePropertyMixStereoToMono) {
-        add_leaf!("MixStereoToMono: {}", p != 0);
-    }
-    if let Ok(p) = get_list_property::<AudioObjectID>(obj, kAudioHardwarePropertyPlugInList) {
-        add_leaf!("PlugInList: {:?}", p);
-    }
-    if let Ok(p) =
-        get_list_property::<AudioObjectID>(obj, kAudioHardwarePropertyTransportManagerList)
-    {
-        add_leaf!("TransportManagerList: {:?}", p);
-    }
-    if let Ok(p) = get_list_property::<AudioObjectID>(obj, kAudioHardwarePropertyBoxList) {
-        add_leaf!("BoxList: {:?}", p);
-    }
-    if let Ok(p) = get_list_property::<AudioObjectID>(obj, kAudioHardwarePropertyClockDeviceList) {
-        add_leaf!("ClockDeviceList: {:?}", p);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioHardwarePropertyProcessIsMain) {
-        add_leaf!("ProcessIsMain: {}", p == 1);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioHardwarePropertyIsInitingOrExiting) {
-        add_leaf!("IsInitingOrExiting: {}", p != 0);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioHardwarePropertyProcessInputMute) {
-        add_leaf!("ProcessInputMute: {}", p != 0);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioHardwarePropertyProcessIsAudible) {
-        add_leaf!("ProcessIsAudible: {}", p != 0);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioHardwarePropertySleepingIsAllowed) {
-        add_leaf!("SleepingIsAllowed: {}", p == 1);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioHardwarePropertyUnloadingIsAllowed) {
-        add_leaf!("UnloadingIsAllowed: {}", p == 1);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioHardwarePropertyHogModeIsAllowed) {
-        add_leaf!("HogModeIsAllowed: {}", p == 1);
-    }
-    if let Ok(p) = get_property::<u32>(obj, kAudioHardwarePropertyUserSessionIsActiveOrHeadless) {
-        add_leaf!("UserSessionIsActiveOrHeadless: {}", p != 0);
-    }
-    if let Ok(p) = get_property::<AudioHardwarePowerHint>(obj, kAudioHardwarePropertyPowerHint) {
-        add_leaf!("PowerHint: {}", p);
-    }
-    if let Ok(p) = get_list_property::<AudioObjectID>(obj, kAudioHardwarePropertyProcessObjectList)
-    {
-        add_leaf!("ProcessObjectList: {:?}", p);
-    }
-    if let Ok(objects) = get_list_property::<AudioObjectID>(obj, kAudioHardwarePropertyTapList) {
-        add_leaf!("TapList: {:?}", objects);
-    }
+fn traverse_hw(obj: AudioObjectID, opt: TraversalOptions) {
+    prop!(Vec<AudioObjectID>, kAudioHardwarePropertyDevices, obj, opt);
+    prop!(
+        AudioObjectID,
+        kAudioHardwarePropertyDefaultInputDevice,
+        obj,
+        opt
+    );
+    prop!(
+        AudioObjectID,
+        kAudioHardwarePropertyDefaultOutputDevice,
+        obj,
+        opt
+    );
+    prop!(
+        AudioObjectID,
+        kAudioHardwarePropertyDefaultSystemOutputDevice,
+        obj,
+        opt
+    );
+    prop!(bool, kAudioHardwarePropertyMixStereoToMono, obj, opt);
+    prop!(
+        Vec<AudioObjectID>,
+        kAudioHardwarePropertyPlugInList,
+        obj,
+        opt
+    );
+    prop!(
+        Vec<AudioObjectID>,
+        kAudioHardwarePropertyTransportManagerList,
+        obj,
+        opt
+    );
+    prop!(Vec<AudioObjectID>, kAudioHardwarePropertyBoxList, obj, opt);
+    prop!(
+        Vec<AudioObjectID>,
+        kAudioHardwarePropertyClockDeviceList,
+        obj,
+        opt
+    );
+    prop!(bool, kAudioHardwarePropertyProcessIsMain, obj, opt);
+    prop!(bool, kAudioHardwarePropertyIsInitingOrExiting, obj, opt);
+    prop!(bool, kAudioHardwarePropertyProcessInputMute, obj, opt);
+    prop!(bool, kAudioHardwarePropertyProcessIsAudible, obj, opt);
+    prop!(bool, kAudioHardwarePropertySleepingIsAllowed, obj, opt);
+    prop!(bool, kAudioHardwarePropertyUnloadingIsAllowed, obj, opt);
+    prop!(bool, kAudioHardwarePropertyHogModeIsAllowed, obj, opt);
+    prop!(
+        bool,
+        kAudioHardwarePropertyUserSessionIsActiveOrHeadless,
+        obj,
+        opt
+    );
+    prop!(
+        AudioHardwarePowerHint,
+        kAudioHardwarePropertyPowerHint,
+        obj,
+        opt
+    );
+    prop!(
+        Vec<AudioObjectID>,
+        kAudioHardwarePropertyProcessObjectList,
+        obj,
+        opt
+    );
+    prop!(Vec<AudioObjectID>, kAudioHardwarePropertyTapList, obj, opt);
 }
 
-pub fn traverse_obj(obj: AudioObjectID, opt: TraversalOptions) {
-    let address = AudioObjectPropertyAddress {
-        mSelector: kAudioObjectPropertyOwnedObjects,
-        mScope: kAudioObjectPropertyScopeGlobal,
-        mElement: kAudioObjectPropertyElementMaster,
-    };
-    let mut size: usize = 0;
-    let status = audio_object_get_property_data_size(obj, &address, &mut size);
-    if status != 0 {
-        size = 0;
-    }
-
-    let mut objects: Vec<AudioObjectID> =
-        vec![AudioObjectID::default(); size / mem::size_of::<AudioObjectID>()];
-    let status = audio_object_get_property_data(obj, &address, &mut size, objects.as_mut_ptr());
-    let objects = match status {
-        0 => Ok(objects
-            .into_iter()
-            .take(size)
-            .collect::<Vec<AudioObjectID>>()),
-        e => Err(e),
-    };
-
+fn traverse_obj(obj: AudioObjectID, opt: TraversalOptions) {
+    let owned_objects = get_list_property::<AudioObjectID>(obj, kAudioObjectPropertyOwnedObjects);
     let base_class_id = get_property::<AudioClassID>(obj, kAudioObjectPropertyBaseClass);
     let class_id = get_property::<AudioClassID>(obj, kAudioObjectPropertyClass);
     if !opt.contains(TraversalOptions::INCLUDE_CONTROLS)
@@ -669,37 +758,26 @@ pub fn traverse_obj(obj: AudioObjectID, opt: TraversalOptions) {
     add_branch!("AudioObjectID: {}", obj);
     add_class_id("BaseClass", base_class_id);
     add_class_id("Class", class_id);
-    if let Ok(p) = get_property::<AudioObjectID>(obj, kAudioObjectPropertyOwner) {
-        add_leaf!("Owner: {:?}", p);
-    }
-    if let Ok(p) = get_string_property(obj, kAudioObjectPropertyName) {
-        add_leaf!("Name: {:?}", p);
-    }
-    if let Ok(p) = get_string_property(obj, kAudioObjectPropertyModelName) {
-        add_leaf!("Model Name: {:?}", p);
-    }
-    if let Ok(p) = get_string_property(obj, kAudioObjectPropertyManufacturer) {
-        add_leaf!("Manufacturer: {:?}", p);
-    }
-    if let Ok(p) = get_string_property(obj, kAudioObjectPropertyElementName) {
-        add_leaf!("Element Name: {:?}", p);
-    }
-    if let Ok(p) = get_string_property(obj, kAudioObjectPropertyElementNumberName) {
-        add_leaf!("Element Number Name: {:?}", p);
-    }
-    if let Ok(p) = get_string_property(obj, kAudioDevicePropertyDeviceUID) {
-        add_leaf!("Device UID: {:?}", p);
-    }
+    prop!(bool, kAudioObjectPropertyOwner, obj, opt);
+    prop!(string, kAudioObjectPropertyName, obj, opt);
+    prop!(string, kAudioObjectPropertyModelName, obj, opt);
+    prop!(string, kAudioObjectPropertyManufacturer, obj, opt);
+    prop!(string, kAudioObjectPropertyElementName, obj, opt);
+    prop!(string, kAudioObjectPropertyElementNumberName, obj, opt);
+    prop!(string, kAudioDevicePropertyDeviceUID, obj, opt);
     #[allow(non_upper_case_globals)]
     match class_id {
-        Ok(kAudioSystemObjectClassID) => traverse_hw(obj),
-        Ok(kAudioAggregateDeviceClassID) => traverse_aggregate_device(obj),
+        Ok(kAudioSystemObjectClassID) => traverse_hw(obj, opt),
+        Ok(kAudioAggregateDeviceClassID) => {
+            traverse_aggregate_device(obj, opt);
+            traverse_device(obj, opt);
+        }
         Ok(kAudioDeviceClassID) => traverse_device(obj, opt),
         Ok(kAudioStreamClassID) => traverse_stream(obj, opt),
-        Ok(kAudioProcessClassID) => traverse_process(obj),
+        Ok(kAudioProcessClassID) => traverse_process(obj, opt),
         _ => {}
     }
-    if let Ok(objects) = objects {
+    if let Ok(objects) = owned_objects {
         for obj in objects {
             traverse_obj(obj, opt);
         }
@@ -718,13 +796,15 @@ pub fn traverse_with_options(opt: TraversalOptions) {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub struct TraversalOptions: u8 {
+    pub struct TraversalOptions: u16 {
         const INCLUDE_BOXES = 1 << 0;
         const INCLUDE_CLOCKS = 1 << 1;
         const INCLUDE_STREAMS = 1 << 2;
         const INCLUDE_FORMATS = 1 << 3;
-        const INCLUDE_CONTROLS = 1 << 4;
-        const INCLUDE_PLUGINS = 1 << 5;
-        const INCLUDE_PROCESSES = 1 << 6;
+        const INCLUDE_CHANNELS = 1 << 4;
+        const INCLUDE_CONTROLS = 1 << 5;
+        const INCLUDE_PLUGINS = 1 << 6;
+        const INCLUDE_PROCESSES = 1 << 7;
+        const DEBUG = 1 << 8;
     }
 }
