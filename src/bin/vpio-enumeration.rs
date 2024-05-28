@@ -1,3 +1,4 @@
+extern crate cubeb_coreaudio_samples;
 use cubeb_backend::ffi::*;
 use std::{
     ffi::{c_char, c_void, CStr},
