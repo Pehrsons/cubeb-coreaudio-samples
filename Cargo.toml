@@ -4,8 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bitflags = "2.5"
+debug_tree = "0.2"
 cubeb-backend = "0.13"
 cubeb-coreaudio = { git = "https://github.com/mozilla/cubeb-coreaudio-rs", rev = "d892b0a00cbde15a5a9b1ee34e7f1064fc7e4b9a", features = ["audio-dump"] }
+
+[dependencies.clap]
+features = ["derive"]
+version = "4.5"
+
+[dependencies.coreaudio-sys]
+default-features = false
+features = ["audio_unit", "core_audio", "io_kit_audio"]
+version = "0.2.14"
+
 
 [build-dependencies]
 cc = "1.0"
