@@ -1,7 +1,7 @@
 extern crate cubeb_coreaudio_samples;
 use cubeb_backend::ffi::*;
 use std::{
-    ffi::{c_char, c_void, CStr},
+    ffi::{c_char, c_void},
     mem, ptr,
 };
 
@@ -80,21 +80,7 @@ fn main() {
             &mut collection,
         )
     });
-    let devices = ptr::slice_from_raw_parts(collection.device, collection.count);
-    let devices = unsafe { &*devices };
-    println!("Enumerated {} devices:", collection.count);
-    for d in devices {
-        let tup = (
-            unsafe { CStr::from_ptr(d.friendly_name) },
-            match d.device_type {
-                CUBEB_DEVICE_TYPE_INPUT => "IN",
-                CUBEB_DEVICE_TYPE_OUTPUT => "OUT",
-                _ => "WHAT",
-            },
-            d.max_channels,
-        );
-        println!("{:?}", tup);
-    }
+    println!("Enumerated devices:\n{:#?}", collection);
     unsafe { cubeb_device_collection_destroy(ctx, &mut collection) };
 
     unsafe { cubeb_stream_destroy(stream) };
