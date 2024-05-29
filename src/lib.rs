@@ -306,11 +306,7 @@ fn add_class_id(identifier: &str, id: Result<AudioClassID, OSStatus>) {
         add_leaf!("{} (Known): {:?}", identifier, s);
         return;
     }
-    add_leaf!(
-        "{} (FourCC): {:?}",
-        identifier,
-        CString::new(id.to_be_bytes().to_vec()).unwrap()
-    );
+    add_leaf!("{} (FourCC): {:?}", identifier, CString::new(id.to_be_bytes().to_vec()).unwrap());
 }
 
 macro_rules! prop {
@@ -383,20 +379,8 @@ fn cfarray_get_count(r: usize) -> usize {
 }
 
 fn traverse_aggregate_device(obj: AudioObjectID, opt: TraversalOptions) {
-    prop!(
-        usize,
-        kAudioAggregateDevicePropertyTapList,
-        obj,
-        opt,
-        cfarray_get_count
-    );
-    prop!(
-        usize,
-        kAudioAggregateDevicePropertySubTapList,
-        obj,
-        opt,
-        cfarray_get_count
-    );
+    prop!(usize, kAudioAggregateDevicePropertyTapList, obj, opt, cfarray_get_count);
+    prop!(usize, kAudioAggregateDevicePropertySubTapList, obj, opt, cfarray_get_count);
 }
 
 fn transporttype_to_str(p: u32) -> &'static str {
@@ -424,76 +408,25 @@ fn transporttype_to_str(p: u32) -> &'static str {
 }
 
 fn traverse_device(obj: AudioObjectID, opt: TraversalOptions) {
-    prop!(
-        string,
-        kAudioDevicePropertyConfigurationApplication,
-        obj,
-        opt
-    );
+    prop!(string, kAudioDevicePropertyConfigurationApplication, obj, opt);
     prop!(string, kAudioDevicePropertyDeviceUID, obj, opt);
     prop!(string, kAudioDevicePropertyModelUID, obj, opt);
-    prop!(
-        u32,
-        kAudioDevicePropertyTransportType,
-        obj,
-        opt,
-        transporttype_to_str
-    );
+    prop!(u32, kAudioDevicePropertyTransportType, obj, opt, transporttype_to_str);
     prop!(pid_t, kAudioDevicePropertyHogMode, obj, opt);
-    prop!(
-        Vec<AudioDeviceID>,
-        kAudioDevicePropertyRelatedDevices,
-        obj,
-        opt
-    );
+    prop!(Vec<AudioDeviceID>, kAudioDevicePropertyRelatedDevices, obj, opt);
     prop!(u32, kAudioDevicePropertyClockDomain, obj, opt);
     prop!(string, kAudioDevicePropertyClockDevice, obj, opt);
     prop!(bool, kAudioDevicePropertyDeviceIsAlive, obj, opt);
     prop!(bool, kAudioDevicePropertyDeviceIsRunningSomewhere, obj, opt);
     prop!(bool, kAudioDevicePropertyDeviceIsRunning, obj, opt);
-    prop!(
-        bool,
-        Input,
-        kAudioDevicePropertyDeviceCanBeDefaultDevice,
-        obj,
-        opt
-    );
-    prop!(
-        bool,
-        Output,
-        kAudioDevicePropertyDeviceCanBeDefaultDevice,
-        obj,
-        opt
-    );
-    prop!(
-        bool,
-        Output,
-        kAudioDevicePropertyDeviceCanBeDefaultSystemDevice,
-        obj,
-        opt
-    );
+    prop!(bool, Input, kAudioDevicePropertyDeviceCanBeDefaultDevice, obj, opt);
+    prop!(bool, Output, kAudioDevicePropertyDeviceCanBeDefaultDevice, obj, opt);
+    prop!(bool, Output, kAudioDevicePropertyDeviceCanBeDefaultSystemDevice, obj, opt);
     prop!(u32, Input, kAudioDevicePropertyLatency, obj, opt);
     prop!(u32, Output, kAudioDevicePropertyLatency, obj, opt);
-    prop!(
-        Vec<AudioStreamID>,
-        Input,
-        kAudioDevicePropertyStreams,
-        obj,
-        opt
-    );
-    prop!(
-        Vec<AudioStreamID>,
-        Output,
-        kAudioDevicePropertyStreams,
-        obj,
-        opt
-    );
-    prop!(
-        Vec<AudioObjectID>,
-        kAudioObjectPropertyControlList,
-        obj,
-        opt
-    );
+    prop!(Vec<AudioStreamID>, Input, kAudioDevicePropertyStreams, obj, opt);
+    prop!(Vec<AudioStreamID>, Output, kAudioDevicePropertyStreams, obj, opt);
+    prop!(Vec<AudioObjectID>, kAudioObjectPropertyControlList, obj, opt);
     prop!(u32, Input, kAudioDevicePropertySafetyOffset, obj, opt);
     prop!(u32, Output, kAudioDevicePropertySafetyOffset, obj, opt);
     prop!(f64, kAudioDevicePropertyActualSampleRate, obj, opt);
@@ -508,32 +441,10 @@ fn traverse_device(obj: AudioObjectID, opt: TraversalOptions) {
         );
     }
     prop!(u32, kAudioDevicePropertyBufferFrameSize, obj, opt);
-    prop!(
-        AudioValueRange,
-        kAudioDevicePropertyBufferFrameSizeRange,
-        obj,
-        opt
-    );
-    prop!(
-        u32,
-        kAudioDevicePropertyUsesVariableBufferFrameSizes,
-        obj,
-        opt
-    );
-    prop!(
-        Vec<u32>,
-        Input,
-        kAudioDevicePropertyPreferredChannelsForStereo,
-        obj,
-        opt
-    );
-    prop!(
-        Vec<u32>,
-        Output,
-        kAudioDevicePropertyPreferredChannelsForStereo,
-        obj,
-        opt
-    );
+    prop!(AudioValueRange, kAudioDevicePropertyBufferFrameSizeRange, obj, opt);
+    prop!(u32, kAudioDevicePropertyUsesVariableBufferFrameSizes, obj, opt);
+    prop!(Vec<u32>, Input, kAudioDevicePropertyPreferredChannelsForStereo, obj, opt);
+    prop!(Vec<u32>, Output, kAudioDevicePropertyPreferredChannelsForStereo, obj, opt);
     if opt.contains(TraversalOptions::INCLUDE_CHANNELS) {
         prop!(
             AudioChannelLayout,
@@ -570,30 +481,16 @@ fn terminaltype_to_str(t: u32) -> String {
 
 fn traverse_stream(obj: AudioStreamID, opt: TraversalOptions) {
     prop!(bool, kAudioStreamPropertyIsActive, obj, opt);
-    prop!(
-        u32,
-        kAudioStreamPropertyDirection,
-        obj,
-        opt,
-        |p| if p == 1 { "Input" } else { "Output" }
-    );
-    prop!(
-        u32,
-        kAudioStreamPropertyTerminalType,
-        obj,
-        opt,
-        terminaltype_to_str
-    );
+    prop!(u32, kAudioStreamPropertyDirection, obj, opt, |p| if p == 1 {
+        "Input"
+    } else {
+        "Output"
+    });
+    prop!(u32, kAudioStreamPropertyTerminalType, obj, opt, terminaltype_to_str);
     prop!(u32, kAudioStreamPropertyStartingChannel, obj, opt);
     prop!(u32, Input, kAudioStreamPropertyLatency, obj, opt);
     prop!(u32, Output, kAudioStreamPropertyLatency, obj, opt);
-    prop!(
-        AudioStreamBasicDescription,
-        Pretty,
-        kAudioStreamPropertyVirtualFormat,
-        obj,
-        opt
-    );
+    prop!(AudioStreamBasicDescription, Pretty, kAudioStreamPropertyVirtualFormat, obj, opt);
     if opt.contains(TraversalOptions::INCLUDE_FORMATS) {
         prop!(
             Vec<AudioStreamRangedDescription>,
@@ -603,13 +500,7 @@ fn traverse_stream(obj: AudioStreamID, opt: TraversalOptions) {
             opt
         );
     }
-    prop!(
-        AudioStreamBasicDescription,
-        Pretty,
-        kAudioStreamPropertyPhysicalFormat,
-        obj,
-        opt
-    );
+    prop!(AudioStreamBasicDescription, Pretty, kAudioStreamPropertyPhysicalFormat, obj, opt);
     if opt.contains(TraversalOptions::INCLUDE_FORMATS) {
         prop!(
             Vec<AudioStreamRangedDescription>,
@@ -624,20 +515,8 @@ fn traverse_stream(obj: AudioStreamID, opt: TraversalOptions) {
 fn traverse_process(obj: AudioObjectID, opt: TraversalOptions) {
     prop!(pid_t, kAudioProcessPropertyPID, obj, opt);
     prop!(string, kAudioProcessPropertyBundleID, obj, opt);
-    prop!(
-        Vec<AudioObjectID>,
-        Input,
-        kAudioProcessPropertyDevices,
-        obj,
-        opt
-    );
-    prop!(
-        Vec<AudioObjectID>,
-        Output,
-        kAudioProcessPropertyDevices,
-        obj,
-        opt
-    );
+    prop!(Vec<AudioObjectID>, Input, kAudioProcessPropertyDevices, obj, opt);
+    prop!(Vec<AudioObjectID>, Output, kAudioProcessPropertyDevices, obj, opt);
     prop!(bool, kAudioProcessPropertyIsRunning, obj, opt);
     prop!(bool, kAudioProcessPropertyIsRunningInput, obj, opt);
     prop!(bool, kAudioProcessPropertyIsRunningOutput, obj, opt);
@@ -645,44 +524,14 @@ fn traverse_process(obj: AudioObjectID, opt: TraversalOptions) {
 
 fn traverse_hw(obj: AudioObjectID, opt: TraversalOptions) {
     prop!(Vec<AudioObjectID>, kAudioHardwarePropertyDevices, obj, opt);
-    prop!(
-        AudioObjectID,
-        kAudioHardwarePropertyDefaultInputDevice,
-        obj,
-        opt
-    );
-    prop!(
-        AudioObjectID,
-        kAudioHardwarePropertyDefaultOutputDevice,
-        obj,
-        opt
-    );
-    prop!(
-        AudioObjectID,
-        kAudioHardwarePropertyDefaultSystemOutputDevice,
-        obj,
-        opt
-    );
+    prop!(AudioObjectID, kAudioHardwarePropertyDefaultInputDevice, obj, opt);
+    prop!(AudioObjectID, kAudioHardwarePropertyDefaultOutputDevice, obj, opt);
+    prop!(AudioObjectID, kAudioHardwarePropertyDefaultSystemOutputDevice, obj, opt);
     prop!(bool, kAudioHardwarePropertyMixStereoToMono, obj, opt);
-    prop!(
-        Vec<AudioObjectID>,
-        kAudioHardwarePropertyPlugInList,
-        obj,
-        opt
-    );
-    prop!(
-        Vec<AudioObjectID>,
-        kAudioHardwarePropertyTransportManagerList,
-        obj,
-        opt
-    );
+    prop!(Vec<AudioObjectID>, kAudioHardwarePropertyPlugInList, obj, opt);
+    prop!(Vec<AudioObjectID>, kAudioHardwarePropertyTransportManagerList, obj, opt);
     prop!(Vec<AudioObjectID>, kAudioHardwarePropertyBoxList, obj, opt);
-    prop!(
-        Vec<AudioObjectID>,
-        kAudioHardwarePropertyClockDeviceList,
-        obj,
-        opt
-    );
+    prop!(Vec<AudioObjectID>, kAudioHardwarePropertyClockDeviceList, obj, opt);
     prop!(bool, kAudioHardwarePropertyProcessIsMain, obj, opt);
     prop!(bool, kAudioHardwarePropertyIsInitingOrExiting, obj, opt);
     prop!(bool, kAudioHardwarePropertyProcessInputMute, obj, opt);
@@ -690,24 +539,9 @@ fn traverse_hw(obj: AudioObjectID, opt: TraversalOptions) {
     prop!(bool, kAudioHardwarePropertySleepingIsAllowed, obj, opt);
     prop!(bool, kAudioHardwarePropertyUnloadingIsAllowed, obj, opt);
     prop!(bool, kAudioHardwarePropertyHogModeIsAllowed, obj, opt);
-    prop!(
-        bool,
-        kAudioHardwarePropertyUserSessionIsActiveOrHeadless,
-        obj,
-        opt
-    );
-    prop!(
-        AudioHardwarePowerHint,
-        kAudioHardwarePropertyPowerHint,
-        obj,
-        opt
-    );
-    prop!(
-        Vec<AudioObjectID>,
-        kAudioHardwarePropertyProcessObjectList,
-        obj,
-        opt
-    );
+    prop!(bool, kAudioHardwarePropertyUserSessionIsActiveOrHeadless, obj, opt);
+    prop!(AudioHardwarePowerHint, kAudioHardwarePropertyPowerHint, obj, opt);
+    prop!(Vec<AudioObjectID>, kAudioHardwarePropertyProcessObjectList, obj, opt);
     prop!(Vec<AudioObjectID>, kAudioHardwarePropertyTapList, obj, opt);
 }
 

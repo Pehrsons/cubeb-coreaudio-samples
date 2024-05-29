@@ -40,9 +40,7 @@ pub extern "C" fn noop_state_callback(
 }
 
 fn main() {
-    assert_eq!(CUBEB_OK, unsafe {
-        cubeb_set_log_callback(CUBEB_LOG_NORMAL, Some(print_log))
-    });
+    assert_eq!(CUBEB_OK, unsafe { cubeb_set_log_callback(CUBEB_LOG_NORMAL, Some(print_log)) });
 
     let mut ctx: *mut cubeb = ptr::null_mut();
     assert_eq!(CUBEB_OK, unsafe {
@@ -77,7 +75,5 @@ fn main() {
 
     unsafe { cubeb_destroy(ctx) };
 
-    assert_eq!(CUBEB_OK, unsafe {
-        cubeb_set_log_callback(CUBEB_LOG_DISABLED, None)
-    });
+    assert_eq!(CUBEB_OK, unsafe { cubeb_set_log_callback(CUBEB_LOG_DISABLED, None) });
 }
