@@ -414,6 +414,7 @@ fn traverse_device(obj: AudioObjectID, opt: TraversalOptions) {
     prop!(u32, kAudioDevicePropertyTransportType, obj, opt, transporttype_to_str);
     prop!(pid_t, kAudioDevicePropertyHogMode, obj, opt);
     prop!(Vec<AudioDeviceID>, kAudioDevicePropertyRelatedDevices, obj, opt);
+    prop!(Vec<AudioDeviceID>, kAudioAggregateDevicePropertyActiveSubDeviceList, obj, opt);
     prop!(u32, kAudioDevicePropertyClockDomain, obj, opt);
     prop!(string, kAudioDevicePropertyClockDevice, obj, opt);
     prop!(bool, kAudioDevicePropertyDeviceIsAlive, obj, opt);
@@ -606,7 +607,7 @@ fn traverse_obj(obj: AudioObjectID, opt: TraversalOptions) {
             traverse_aggregate_device(obj, opt);
             traverse_device(obj, opt);
         }
-        Ok(kAudioDeviceClassID) => traverse_device(obj, opt),
+        Ok(kAudioSubDeviceClassID) | Ok(kAudioDeviceClassID) => traverse_device(obj, opt),
         Ok(kAudioStreamClassID) => traverse_stream(obj, opt),
         Ok(kAudioProcessClassID) => traverse_process(obj, opt),
         _ => {}
