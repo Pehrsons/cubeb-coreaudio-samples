@@ -339,6 +339,12 @@ macro_rules! prop {
     (string, $prop: expr, $obj: expr, $opt: expr) => {
         prop!(@internal get_string_property, ($obj, $prop), $opt);
     };
+    (Vec<$t: ty>, Pretty, Input, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_list_property_scoped::<$t>, @pretty "", @prefix Input, ($obj, $prop, kAudioObjectPropertyScopeInput), $opt$(, $map)?);
+    };
+    (Vec<$t: ty>, Pretty, Output, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
+        prop!(@internal get_list_property_scoped::<$t>, @pretty "", @prefix Output, ($obj, $prop, kAudioObjectPropertyScopeOutput), $opt$(, $map)?);
+    };
     (Vec<$t: ty>, Input, $prop: expr, $obj: expr, $opt: expr $(, $map: expr)?) => {
         prop!(@internal get_list_property_scoped::<$t>, @prefix Input, ($obj, $prop, kAudioObjectPropertyScopeInput), $opt$(, $map)?);
     };
@@ -408,6 +414,43 @@ fn transporttype_to_str(p: u32) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone)]
+#[allow(non_camel_case_types, non_snake_case, dead_code)]
+struct AudioChannelLayout_ExpandedChannels {
+    mChannelLayoutTag: AudioChannelLayoutTag,
+    mChannelBitmap: AudioChannelBitmap,
+    mNumberChannelDescriptions: UInt32,
+    mChannelDescriptions: Vec<AudioChannelDescription>,
+}
+
+impl AudioChannelLayout_ExpandedChannels {
+    fn new(l: AudioChannelLayout, cs: Vec<AudioChannelDescription>) -> Self {
+        Self {
+            mChannelLayoutTag: l.mChannelLayoutTag,
+            mChannelBitmap: l.mChannelBitmap,
+            mNumberChannelDescriptions: l.mNumberChannelDescriptions,
+            mChannelDescriptions: cs,
+        }
+    }
+}
+
+fn expand_channel_layout(data: Vec<u8>) -> AudioChannelLayout_ExpandedChannels {
+    let acl_len = mem::size_of::<AudioChannelLayout>();
+    let acd_len = mem::size_of::<AudioChannelDescription>();
+    let acl_base_len = acl_len - acd_len;
+    assert!(data.len() >= acl_base_len);
+    let layout_ptr = data.as_ptr() as *const AudioChannelLayout;
+    let num_channels = (data.len() - acl_base_len) / acd_len;
+    debug_assert_eq!(unsafe { *layout_ptr }.mNumberChannelDescriptions as usize, num_channels);
+    let cs = unsafe {
+        std::slice::from_raw_parts(
+            (data.as_ptr().wrapping_add(acl_base_len)) as *const AudioChannelDescription,
+            num_channels,
+        )
+    };
+    AudioChannelLayout_ExpandedChannels::new(unsafe { *layout_ptr }, cs.into())
+}
+
 fn traverse_device(obj: AudioObjectID, opt: TraversalOptions) {
     prop!(string, kAudioDevicePropertyConfigurationApplication, obj, opt);
     prop!(string, kAudioDevicePropertyDeviceUID, obj, opt);
@@ -449,12 +492,13 @@ fn traverse_device(obj: AudioObjectID, opt: TraversalOptions) {
     prop!(Vec<u32>, Output, kAudioDevicePropertyPreferredChannelsForStereo, obj, opt);
     if opt.contains(TraversalOptions::INCLUDE_CHANNELS) {
         prop!(
-            AudioChannelLayout,
+            Vec<u8>,
             Pretty,
             Output,
             kAudioDevicePropertyPreferredChannelLayout,
             obj,
-            opt
+            opt,
+            expand_channel_layout
         );
     }
     prop!(f32, kAudioDevicePropertyIOCycleUsage, obj, opt);
