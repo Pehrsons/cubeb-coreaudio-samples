@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::fmt;
 use std::mem;
 
 use coreaudio_sys::*;
@@ -93,8 +94,8 @@ impl Drop for StringRef {
     }
 }
 
-impl std::fmt::Display for StringRef {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for StringRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let string =
             String::from_utf8(utf8_from_cfstringref(self.0)).expect("convert bytes to a String");
         write!(f, "{}", string)
@@ -247,7 +248,7 @@ pub fn get_string_property(obj: AudioObjectID, selector: u32) -> Result<String, 
 }
 
 fn class_to_str(obj: AudioClassID) -> Option<&'static str> {
-    #[allow(non_upper_case_globals)]
+    #[allow(non_upper_case_globals, non_snake_case)]
     match obj {
         // AudioHardware.h
         kAudioSystemObjectClassID => Some("AudioSystemObject"),
@@ -384,7 +385,7 @@ fn traverse_aggregate_device(obj: AudioObjectID, opt: TraversalOptions) {
 }
 
 fn transporttype_to_str(p: u32) -> &'static str {
-    #[allow(non_upper_case_globals)]
+    #[allow(non_upper_case_globals, non_snake_case)]
     match p {
         kAudioDeviceTransportTypeUnknown => "Unknown",
         kAudioDeviceTransportTypeBuiltIn => "BuiltIn",
@@ -461,7 +462,7 @@ fn traverse_device(obj: AudioObjectID, opt: TraversalOptions) {
 }
 
 fn terminaltype_to_str(t: u32) -> String {
-    #[allow(non_upper_case_globals)]
+    #[allow(non_upper_case_globals, non_snake_case)]
     match t {
         kAudioStreamTerminalTypeUnknown => "Unknown".to_string(),
         kAudioStreamTerminalTypeLine => "Line".to_string(),
@@ -600,7 +601,7 @@ fn traverse_obj(obj: AudioObjectID, opt: TraversalOptions) {
     prop!(string, kAudioObjectPropertyElementName, obj, opt);
     prop!(string, kAudioObjectPropertyElementNumberName, obj, opt);
     prop!(string, kAudioDevicePropertyDeviceUID, obj, opt);
-    #[allow(non_upper_case_globals)]
+    #[allow(non_upper_case_globals, non_snake_case)]
     match class_id {
         Ok(kAudioSystemObjectClassID) => traverse_hw(obj, opt),
         Ok(kAudioAggregateDeviceClassID) => {
