@@ -69,6 +69,7 @@ fn main() {
         rate: 48000,
         layout: CUBEB_LAYOUT_MONO,
         prefs: CUBEB_STREAM_PREF_VOICE,
+        input_params: CUBEB_INPUT_PROCESSING_PARAM_NONE,
     };
 
     // This mimics what Firefox does with the

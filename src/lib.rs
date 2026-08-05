@@ -666,12 +666,12 @@ fn traverse_obj(obj: AudioObjectID, opt: TraversalOptions) {
 
 pub fn traverse() {
     traverse_obj(kAudioObjectSystemObject, TraversalOptions::empty());
-    default_tree().flush_print();
+    default_tree().print();
 }
 
 pub fn traverse_with_options(opt: TraversalOptions) {
     traverse_obj(kAudioObjectSystemObject, opt);
-    default_tree().flush_print();
+    default_tree().print();
 }
 
 bitflags::bitflags! {

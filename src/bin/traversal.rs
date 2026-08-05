@@ -98,6 +98,7 @@ fn main() {
         rate: 48000,
         layout: CUBEB_LAYOUT_MONO,
         prefs: CUBEB_STREAM_PREF_VOICE,
+        input_params: CUBEB_INPUT_PROCESSING_PARAM_NONE,
     };
     if args.use_vpio {
         assert_eq!(CUBEB_OK, unsafe {

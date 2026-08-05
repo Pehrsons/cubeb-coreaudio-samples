@@ -5,10 +5,11 @@ edition = "2021"
 
 [dependencies]
 bitflags = "2.5"
-debug_tree = "0.2"
-cubeb-backend = "0.13"
-cubeb-coreaudio = { git = "https://github.com/mozilla/cubeb-coreaudio-rs", rev = "1796ace5bdd08ec8baa56bbf7170a08d760c984b", features = [
+debug_tree = "0.4"
+cubeb-backend = "0.34"
+cubeb-coreaudio = { git = "https://github.com/mozilla/cubeb-coreaudio-rs", rev = "840f69c1b3f95accd582555e10abcef8ee67514b", features = [
     "audio-dump",
+    "vpio-forcelist",
 ] }
 
 [dependencies.clap]
@@ -18,7 +19,7 @@ version = "4.5"
 [dependencies.coreaudio-sys]
 default-features = false
 features = ["audio_unit", "core_audio", "io_kit_audio"]
-version = "0.2.14"
+version = "0.2.18"
 
 
 [build-dependencies]
