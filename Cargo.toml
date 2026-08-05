@@ -9,8 +9,13 @@ debug_tree = "0.4"
 cubeb-backend = "0.34"
 cubeb-coreaudio = { git = "https://github.com/mozilla/cubeb-coreaudio-rs", rev = "840f69c1b3f95accd582555e10abcef8ee67514b", features = [
     "audio-dump",
-    "vpio-forcelist",
 ] }
+
+[features]
+# On by default to match Firefox. Build with --no-default-features to compare against a backend
+# that does not force VPIO for the built-in mic.
+default = ["vpio-forcelist"]
+vpio-forcelist = ["cubeb-coreaudio/vpio-forcelist"]
 
 [dependencies.clap]
 features = ["derive"]

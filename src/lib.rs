@@ -8,6 +8,20 @@ use debug_tree::{add_branch, add_leaf, default_tree};
 use std::os::raw::c_void;
 use std::ptr;
 
+pub mod devinfo;
+pub mod meter;
+pub mod probe;
+
+/// Render a four-character code, as CoreAudio uses for most of its enums, as a readable string.
+pub fn fourcc(code: u32) -> String {
+    let bytes = code.to_be_bytes();
+    if bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        String::from_utf8_lossy(&bytes).to_string()
+    } else {
+        format!("{:#010x}", code)
+    }
+}
+
 #[derive(Debug)]
 struct StringRef(CFStringRef);
 
