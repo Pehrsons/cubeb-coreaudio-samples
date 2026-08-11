@@ -118,14 +118,20 @@ const SCENARIOS: &[(&str, &str, &str)] = &[
          default and resamples to the requested rate.",
         "probe on; \
          note baseline, no VPIO anywhere; \
-         measure; \
+         measure 5; \
          open input-agc voice proc; open duplex-agc voice proc duplex; \
          open input-noagc voice aec+ns; \
-         note three non-bypassed VPIO configurations side by side -- input-agc is what cubeb does \
-         today for an input-only stream, duplex-agc adds the output side WebKit always leaves \
-         enabled, input-noagc turns AGC off which WebKit never does -- all three should land \
-         within a dB or two of each other, so any real gap points at that setting; \
-         measure",
+         note three non-bypassed VPIO configurations side by side, in the first seconds after \
+         start -- input-agc is what cubeb does today for an input-only stream, duplex-agc adds the \
+         output side WebKit always leaves enabled, input-noagc turns AGC off which WebKit never \
+         does -- all three should land within a dB or two of each other, so any real gap points at \
+         that setting; \
+         measure 5; \
+         sleep 12; volume ?; \
+         note the same three once the voice processing has settled -- bug 2054983 comment 6 \
+         reports the level dropping about 5 dB a few seconds in, so compare against the window \
+         above, and check whether the device volume moved on its own; \
+         measure 6",
     ),
     (
         "churn",
@@ -137,16 +143,24 @@ const SCENARIOS: &[(&str, &str, &str)] = &[
         "probe on; \
          note baseline before any VPIO use; \
          measure 4; \
-         open ref voice proc; note a processed stream, first use; measure 4; close ref; \
+         open ref voice proc; \
+         note first use, in the first seconds after start; measure 4; \
+         sleep 10; volume ?; \
+         note first use, once the voice processing has settled -- bug 2054983 comment 6 reports \
+         losing about 5 dB a few seconds in, which would show up as a gap against the window \
+         above; \
+         measure 4; close ref; \
          cycle 5 voice proc; sleep 12; cycle 5 voice proc; sleep 12; \
-         open ref2 voice proc; note a processed stream after 10 cycles and two real disposals; \
-         measure 4; close ref2; \
+         open ref2 voice proc; \
+         note after 10 cycles and two real disposals, first seconds; measure 4; \
+         sleep 10; note after 10 cycles, settled; measure 4; close ref2; \
          cycle 5 voice proc; sleep 12; cycle 5 voice proc; sleep 12; \
-         open ref3 voice proc; note a processed stream after 20 cycles -- compare with the first; \
-         measure 4; \
-         volume ?; \
-         note the plain client alone again, past the idle timeout; \
-         close ref3; sleep 12; probe restart; measure 4",
+         open ref3 voice proc; \
+         note after 20 cycles, first seconds -- compare with the very first stream; measure 4; \
+         sleep 10; volume ?; \
+         note after 20 cycles, settled -- compare with the first settled window; measure 4; \
+         close ref3; sleep 12; probe restart; \
+         note the plain client alone again, past the idle timeout; measure 4",
     ),
     (
         "probe-during-vpio",
