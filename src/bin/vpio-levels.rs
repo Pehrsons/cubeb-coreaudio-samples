@@ -375,6 +375,8 @@ Steps, separated by ';':
                         with that measurement and in the closing summary.
   volume <scalar|?>     Read, or set, the device's input volume (the system input slider). The
                         original value is restored when the run ends.
+  probevol <v> [bus]    Set the probe unit's own Volume parameter (kHALOutputParam_Volume), to
+                        test whether that per-client knob affects capture. Bus 1 by default.
   cycle <n> [spec...]   Open and immediately close a stream n times, to churn VPIO units. Note
                         that back-to-back cycles reuse the pooled unit; put `sleep 12` between
                         `cycle` steps to cross VPIO_IDLE_TIMEOUT so units are really disposed of
@@ -406,6 +408,10 @@ enum Step {
     Measure(Option<f64>),
     Note(String),
     Volume(Option<f32>),
+    ProbeUnitVolume {
+        value: f32,
+        element: u32,
+    },
     Cycle {
         count: usize,
         spec: StreamSpec,
@@ -613,6 +619,18 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                     _ => return Err("`tone` needs `on` or `off`".to_string()),
                 };
                 Step::Tone { name, on }
+            }
+            "probevol" => {
+                let value = tokens
+                    .get(1)
+                    .ok_or("`probevol` needs a value")?
+                    .parse::<f32>()
+                    .map_err(|e| format!("bad probevol value: {}", e))?;
+                let element = match tokens.get(2) {
+                    Some(bus) => bus.parse::<u32>().map_err(|e| format!("bad bus: {}", e))?,
+                    None => 1,
+                };
+                Step::ProbeUnitVolume { value, element }
             }
             "volume" => match tokens.get(1) {
                 Some(&"?") | None => Step::Volume(None),
@@ -848,6 +866,25 @@ impl Runner {
             }
             Step::Note(text) => self.pending_note = Some(text),
             Step::Volume(scalar) => self.volume(scalar),
+            Step::ProbeUnitVolume { value, element } => {
+                let result = match self.probe.as_ref() {
+                    Some(probe) => probe.set_unit_volume(value, element),
+                    None => {
+                        println!("[{:6.1}s] probevol: no probe running", self.elapsed());
+                        return;
+                    }
+                };
+                println!(
+                    "[{:6.1}s] probevol {} on bus {}: {}",
+                    self.elapsed(),
+                    value,
+                    element,
+                    match result {
+                        Ok(()) => "set".to_string(),
+                        Err(e) => format!("failed, err {}", e),
+                    }
+                );
+            }
             Step::Cycle { count, spec } => self.cycle(count, spec),
             Step::DevInfo => {
                 let snapshot = DeviceSnapshot::capture(self.device);

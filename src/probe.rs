@@ -163,6 +163,21 @@ impl InputProbe {
         Ok(())
     }
 
+    /// Set this unit's own Volume parameter (`kHALOutputParam_Volume`). Unlike the device's input
+    /// volume this is per-client state, so it is the only candidate for an app-scoped input gain.
+    pub fn set_unit_volume(&self, value: f32, element: AudioUnitElement) -> Result<(), OSStatus> {
+        check(unsafe {
+            AudioUnitSetParameter(
+                self.unit,
+                kHALOutputParam_Volume,
+                kAudioUnitScope_Global,
+                element,
+                value,
+                0,
+            )
+        })
+    }
+
     pub fn device(&self) -> AudioDeviceID {
         self.device
     }
