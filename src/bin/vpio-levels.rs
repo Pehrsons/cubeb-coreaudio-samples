@@ -127,6 +127,27 @@ const SCENARIOS: &[(&str, &str, &str)] = &[
          measure",
     ),
     (
+        "churn",
+        "For bug 2054983 comment 6: capture that degrades after repeated use, where Safari stays \
+         fine. Each round crosses VPIO_IDLE_TIMEOUT so the pooled unit is really disposed of and \
+         recreated, which is what a user starting and stopping capture repeatedly produces. Watch \
+         whether the processed level drifts down round over round, and whether any stream warns \
+         about receiving no input.",
+        "probe on; \
+         note baseline before any VPIO use; \
+         measure 4; \
+         open ref voice proc; note a processed stream, first use; measure 4; close ref; \
+         cycle 5 voice proc; sleep 12; cycle 5 voice proc; sleep 12; \
+         open ref2 voice proc; note a processed stream after 10 cycles and two real disposals; \
+         measure 4; close ref2; \
+         cycle 5 voice proc; sleep 12; cycle 5 voice proc; sleep 12; \
+         open ref3 voice proc; note a processed stream after 20 cycles -- compare with the first; \
+         measure 4; \
+         volume ?; \
+         note the plain client alone again, past the idle timeout; \
+         close ref3; sleep 12; probe restart; measure 4",
+    ),
+    (
         "probe-during-vpio",
         "What a plain CoreAudio client gets before, during and after a processed VPIO stream \
          (the reason the VPIO forcelist exists)",
@@ -354,6 +375,10 @@ Steps, separated by ';':
                         with that measurement and in the closing summary.
   volume <scalar|?>     Read, or set, the device's input volume (the system input slider). The
                         original value is restored when the run ends.
+  cycle <n> [spec...]   Open and immediately close a stream n times, to churn VPIO units. Note
+                        that back-to-back cycles reuse the pooled unit; put `sleep 12` between
+                        `cycle` steps to cross VPIO_IDLE_TIMEOUT so units are really disposed of
+                        and recreated.
   measure [secs]        Capture for a while and report levels for everything live.
   sleep <secs>          Wait without reporting (e.g. past the 10s VPIO idle timeout).
   devinfo               Dump the input device's CoreAudio properties.
@@ -381,6 +406,10 @@ enum Step {
     Measure(Option<f64>),
     Note(String),
     Volume(Option<f32>),
+    Cycle {
+        count: usize,
+        spec: StreamSpec,
+    },
     Sleep(f64),
     DevInfo,
 }
@@ -448,6 +477,54 @@ fn describe_params(params: cubeb_input_processing_params) -> String {
     }
 }
 
+/// Parse the tokens that describe a stream, shared by `open` and `cycle`.
+fn parse_stream_spec(tokens: &[&str], raw: &str) -> Result<StreamSpec, String> {
+    let mut spec = StreamSpec {
+        voice: false,
+        duplex: false,
+        tone: false,
+        input: None,
+        output: None,
+        params: None,
+        text: String::new(),
+    };
+    for token in tokens {
+        match *token {
+            "voice" => spec.voice = true,
+            "duplex" => spec.duplex = true,
+            "tone" => spec.tone = true,
+            token if token.starts_with("in=") => {
+                spec.input = Some(token["in=".len()..].to_string())
+            }
+            token if token.starts_with("out=") => {
+                spec.duplex = true;
+                spec.output = Some(token["out=".len()..].to_string())
+            }
+            other => match parse_params(other) {
+                Some(params) => spec.params = Some(params),
+                None => return Err(format!("Unknown token \"{}\" in \"{}\"", other, raw.trim())),
+            },
+        }
+    }
+    if let Some(device) = &spec.input {
+        spec.text = format!("in={} ", device);
+    }
+    if let Some(device) = &spec.output {
+        spec.text = format!("{}out={} ", spec.text, device);
+    }
+    spec.text = format!(
+        "{}{}, {}, params {}",
+        spec.text,
+        if spec.voice { "voice" } else { "no voice pref" },
+        if spec.duplex { "duplex" } else { "input-only" },
+        match spec.params {
+            Some(p) => describe_params(p),
+            None => "unset".to_string(),
+        }
+    );
+    Ok(spec)
+}
+
 fn parse(script: &str) -> Result<Vec<Step>, String> {
     let mut steps = Vec::new();
     for raw in script.split(';') {
@@ -456,62 +533,24 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
             continue;
         }
         let step = match tokens[0] {
+            "cycle" => {
+                let count = tokens
+                    .get(1)
+                    .ok_or("`cycle` needs a count")?
+                    .parse::<usize>()
+                    .map_err(|e| format!("bad cycle count: {}", e))?;
+                Step::Cycle {
+                    count,
+                    spec: parse_stream_spec(&tokens[2..], raw)?,
+                }
+            }
             "open" => {
                 let name = tokens
                     .get(1)
                     .ok_or_else(|| format!("`open` needs a stream name: \"{}\"", raw.trim()))?;
-                let mut spec = StreamSpec {
-                    voice: false,
-                    duplex: false,
-                    tone: false,
-                    input: None,
-                    output: None,
-                    params: None,
-                    text: String::new(),
-                };
-                for token in &tokens[2..] {
-                    match *token {
-                        "voice" => spec.voice = true,
-                        "duplex" => spec.duplex = true,
-                        "tone" => spec.tone = true,
-                        token if token.starts_with("in=") => {
-                            spec.input = Some(token["in=".len()..].to_string())
-                        }
-                        token if token.starts_with("out=") => {
-                            spec.duplex = true;
-                            spec.output = Some(token["out=".len()..].to_string())
-                        }
-                        other => match parse_params(other) {
-                            Some(params) => spec.params = Some(params),
-                            None => {
-                                return Err(format!(
-                                    "Unknown token \"{}\" in \"{}\"",
-                                    other,
-                                    raw.trim()
-                                ))
-                            }
-                        },
-                    }
-                }
-                if let Some(device) = &spec.input {
-                    spec.text = format!("in={} ", device);
-                }
-                if let Some(device) = &spec.output {
-                    spec.text = format!("{}out={} ", spec.text, device);
-                }
-                spec.text = format!(
-                    "{}{}, {}, params {}",
-                    spec.text,
-                    if spec.voice { "voice" } else { "no voice pref" },
-                    if spec.duplex { "duplex" } else { "input-only" },
-                    match spec.params {
-                        Some(p) => describe_params(p),
-                        None => "unset".to_string(),
-                    }
-                );
                 Step::Open {
                     name: name.to_string(),
-                    spec,
+                    spec: parse_stream_spec(&tokens[2..], raw)?,
                 }
             }
             "close" | "stop" | "start" => {
@@ -809,6 +848,7 @@ impl Runner {
             }
             Step::Note(text) => self.pending_note = Some(text),
             Step::Volume(scalar) => self.volume(scalar),
+            Step::Cycle { count, spec } => self.cycle(count, spec),
             Step::DevInfo => {
                 let snapshot = DeviceSnapshot::capture(self.device);
                 println!("[{:6.1}s] device state:\n{}", self.elapsed(), snapshot.describe());
@@ -817,16 +857,36 @@ impl Runner {
         }
     }
 
+    /// Churn VPIO units: open and immediately close a stream `count` times. Back-to-back cycles
+    /// reuse the pooled unit, so a `sleep` past VPIO_IDLE_TIMEOUT between `cycle` steps is what
+    /// makes units actually get disposed of and recreated.
+    fn cycle(&mut self, count: usize, spec: StreamSpec) {
+        println!("[{:6.1}s] cycle {} x ({}) ...", self.elapsed(), count, spec.text);
+        for i in 0..count {
+            let name = format!("cycle{}", i);
+            self.open_inner(name.clone(), spec.clone(), false);
+            thread::sleep(Duration::from_millis(250));
+            self.close_inner(&name, false);
+        }
+        println!("    {} cycles done", count);
+    }
+
     fn open(&mut self, name: String, spec: StreamSpec) {
-        println!(
-            "[{:6.1}s] open {} ({}) [device at {} ch]",
-            self.elapsed(),
-            name,
-            spec.text,
-            input_channels(self.device)
-                .map(|c| c.to_string())
-                .unwrap_or_default()
-        );
+        self.open_inner(name, spec, true);
+    }
+
+    fn open_inner(&mut self, name: String, spec: StreamSpec, verbose: bool) {
+        if verbose {
+            println!(
+                "[{:6.1}s] open {} ({}) [device at {} ch]",
+                self.elapsed(),
+                name,
+                spec.text,
+                input_channels(self.device)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+            );
+        }
         assert!(!self.streams.iter().any(|s| s.name == name), "duplicate stream name");
 
         let meter = Arc::new(Meter::new(name.clone()));
@@ -919,7 +979,7 @@ impl Runner {
         // reports an artificially low level, or nothing at all.
         let start = Instant::now();
         let mut first_input = None;
-        while start.elapsed() < FIRST_INPUT_TIMEOUT {
+        while verbose && start.elapsed() < FIRST_INPUT_TIMEOUT {
             if meter.snapshot().frames > 0 {
                 first_input = Some(start.elapsed());
                 break;
@@ -930,11 +990,12 @@ impl Runner {
             Some(latency) => {
                 println!("    [{}] first input after {} ms", name, latency.as_millis())
             }
-            None => println!(
+            None if verbose => println!(
                 "    [{}] WARNING: no input within {:.0}s of starting",
                 name,
                 FIRST_INPUT_TIMEOUT.as_secs_f64()
             ),
+            None => {}
         }
 
         self.streams.push(Stream {
@@ -955,7 +1016,13 @@ impl Runner {
     }
 
     fn close(&mut self, name: &str) {
-        println!("[{:6.1}s] close {}", self.elapsed(), name);
+        self.close_inner(name, true);
+    }
+
+    fn close_inner(&mut self, name: &str, verbose: bool) {
+        if verbose {
+            println!("[{:6.1}s] close {}", self.elapsed(), name);
+        }
         let index = self
             .streams
             .iter()
