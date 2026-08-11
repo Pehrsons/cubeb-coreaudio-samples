@@ -9,8 +9,14 @@ use std::os::raw::c_void;
 use std::ptr;
 
 pub mod devinfo;
+pub mod knobs;
 pub mod meter;
 pub mod probe;
+
+/// Read a `CFStringRef` into an owned String.
+pub fn string_from_cfstringref(string_ref: CFStringRef) -> String {
+    String::from_utf8_lossy(&utf8_from_cfstringref(string_ref)).to_string()
+}
 
 /// Render a four-character code, as CoreAudio uses for most of its enums, as a readable string.
 pub fn fourcc(code: u32) -> String {

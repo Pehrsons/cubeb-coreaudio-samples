@@ -148,6 +148,11 @@ struct Args {
     /// List the input and output devices and exit.
     #[clap(long)]
     list_devices: bool,
+    /// List every gain-adjacent knob for the input device -- AudioUnit parameters for both a VPIO
+    /// and a plain capture unit, the device's control objects, and the voice-processing
+    /// properties -- then exit.
+    #[clap(long)]
+    knobs: bool,
     /// Sample rate to request for the cubeb streams.
     #[clap(long, default_value = "48000")]
     rate: u32,
@@ -177,6 +182,19 @@ fn main() {
         for (id, name) in output_devices() {
             println!("{:>12}  {}", id, name);
         }
+        return;
+    }
+
+    if args.knobs {
+        let device = match &args.device {
+            Some(spec) => resolve_input_device(spec).unwrap_or_else(|e| fail(&e)),
+            None => default_input_device().expect("no default input device"),
+        };
+        println!("Input device: {} \"{}\"", device, device_name(device));
+        println!("  AudioUnit parameters and voice-processing properties:");
+        print!("{}", cubeb_coreaudio_samples::knobs::describe_units(device));
+        println!("  Device controls:");
+        print!("{}", cubeb_coreaudio_samples::knobs::describe_device_controls(device));
         return;
     }
 
