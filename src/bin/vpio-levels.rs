@@ -108,6 +108,25 @@ const SCENARIOS: &[(&str, &str, &str)] = &[
          measure",
     ),
     (
+        "safari-compare",
+        "Isolates the ways cubeb configures a non-bypassed VPIO unit differently from WebKit, all \
+         measured in the same window so the acoustics are identical: whether VPIO's output side is \
+         enabled (WebKit never disables it on macOS) and whether AGC is on (WebKit never touches \
+         it, so it keeps VPIO's default). Worth also running with --rate 44100 and --rate 96000: \
+         WebKit configures VPIO at the device's nominal rate, cubeb leaves the unit at its 44100 \
+         default and resamples to the requested rate.",
+        "probe on; \
+         note baseline, no VPIO anywhere; \
+         measure; \
+         open input-agc voice proc; open duplex-agc voice proc duplex; \
+         open input-noagc voice aec+ns; \
+         note three non-bypassed VPIO configurations side by side -- input-agc is what cubeb does \
+         today for an input-only stream, duplex-agc adds the output side WebKit always leaves \
+         enabled, input-noagc turns AGC off which WebKit never does -- all three should land \
+         within a dB or two of each other, so any real gap points at that setting; \
+         measure",
+    ),
+    (
         "probe-during-vpio",
         "What a plain CoreAudio client gets before, during and after a processed VPIO stream \
          (the reason the VPIO forcelist exists)",
