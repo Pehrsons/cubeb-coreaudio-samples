@@ -16,6 +16,7 @@ use crate::{fourcc, get_property_scoped};
 const AU_IN_BUS: AudioUnitElement = 1;
 const AU_OUT_BUS: AudioUnitElement = 0;
 
+#[allow(non_upper_case_globals)]
 fn scope_name(scope: AudioUnitScope) -> &'static str {
     match scope {
         kAudioUnitScope_Global => "global",

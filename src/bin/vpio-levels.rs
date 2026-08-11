@@ -20,7 +20,7 @@ use cubeb_coreaudio_samples::devinfo::{
 };
 use cubeb_coreaudio_samples::knobs;
 use cubeb_coreaudio_samples::meter::{fmt_dbfs, Meter, Report, Snapshot};
-use cubeb_coreaudio_samples::probe::InputProbe;
+use cubeb_coreaudio_samples::probe::{InputProbe, ProbeKind};
 use std::ffi::{c_char, c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,6 +30,13 @@ use std::{process, ptr, slice, thread};
 extern "C" {
     fn print_log(msg: *const c_char, ...);
 }
+
+// Built with --features zeroing-alloc to test whether anything here depends on reading
+// uninitialized heap memory, as Safari's zeroing allocator would mask.
+#[cfg(feature = "zeroing-alloc")]
+#[global_allocator]
+static ALLOC: cubeb_coreaudio_samples::zeroing::ZeroingAlloc =
+    cubeb_coreaudio_samples::zeroing::ZeroingAlloc;
 
 const LATENCY_FRAMES: u32 = 512;
 const TONE_HZ: f64 = 440.0;
@@ -161,6 +168,25 @@ const SCENARIOS: &[(&str, &str, &str)] = &[
          note after 20 cycles, settled -- compare with the first settled window; measure 4; \
          close ref3; sleep 12; probe restart; \
          note the plain client alone again, past the idle timeout; measure 4",
+    ),
+    (
+        "native-vpio",
+        "Sets up VoiceProcessingIO directly, without cubeb, and measures it beside cubeb's own \
+         stream and a plain client, all in the same window. If each native and cubeb pair agrees, \
+         the level behaviour belongs to Apple's voice processing; if they differ, it belongs to how \
+         cubeb configures the unit (rate, format, channel count, output-scope IO). The bypassed pair \
+         is the one to watch on M3 and later, where bypass reads the raw array.",
+        "probe on; \
+         note baseline, plain client only, no voice processing anywhere; \
+         measure 5; \
+         native nat-proc vpio proc; native nat-bypass vpio none; \
+         open cub-proc voice proc; open cub-bypass voice none; \
+         note all four side by side, in the first seconds after start -- each native and cubeb pair \
+         should agree, since the only difference within a pair is who configured the unit; \
+         measure 5; \
+         sleep 12; \
+         note the same four once the voice processing has settled; \
+         measure 6",
     ),
     (
         "probe-during-vpio",
@@ -382,6 +408,15 @@ Steps, separated by ';':
                         Stop or restart a stream without destroying it. Processing params set
                         on a running stream only take effect on restart.
   params <name> <spec>  Set input processing params, e.g. `proc`, `none`, `aec+ns`.
+  native <name> hal|vpio [params] [rate=<hz>] [no-outio]
+                        Open a capture client set up natively, without cubeb. `vpio` instantiates a
+                        VoiceProcessingIO unit directly, so its level can be compared with cubeb's;
+                        without a params spec the unit keeps its own defaults, as WebKit leaves
+                        them. `rate=` sets the unit's capture format rate the way WebKit configures
+                        the mic proc, where omitting it imposes no format at all; note --rate only
+                        applies to cubeb streams. `no-outio` disables IO on the output scope the way
+                        cubeb does for an input-only stream.
+  native off <name>     Close a native client.
   probe on|off|restart  Start/stop a plain non-cubeb CoreAudio capture client, or reopen it so
                         its channel count matches the device's current one (the built-in mic
                         changes it when VPIO attaches).
@@ -417,6 +452,11 @@ enum Step {
         spec: String,
     },
     Probe(ProbeAction),
+    Native {
+        name: String,
+        kind: ProbeKind,
+    },
+    NativeOff(String),
     Tone {
         name: String,
         on: bool,
@@ -614,6 +654,42 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                     spec: spec.to_string(),
                 }
             }
+            "native" => {
+                let name = tokens.get(1).ok_or("`native` needs a name")?.to_string();
+                if name == "off" {
+                    let target = tokens
+                        .get(2)
+                        .ok_or("`native off` needs a name")?
+                        .to_string();
+                    steps.push(Step::NativeOff(target));
+                    continue;
+                }
+                let kind =
+                    match tokens.get(2) {
+                        Some(&"hal") => ProbeKind::Hal,
+                        Some(&"vpio") => ProbeKind::Vpio {
+                            params: match tokens.get(3) {
+                                Some(spec) if !spec.starts_with("rate=") && *spec != "no-outio" => {
+                                    Some(parse_params(spec).ok_or_else(|| {
+                                        format!("Unknown params spec \"{}\"", spec)
+                                    })?)
+                                }
+                                _ => None,
+                            },
+                            rate: match tokens.iter().find(|t| t.starts_with("rate=")) {
+                                Some(token) => Some(
+                                    token["rate=".len()..]
+                                        .parse::<f64>()
+                                        .map_err(|e| format!("bad rate: {}", e))?,
+                                ),
+                                None => None,
+                            },
+                            disable_output_io: tokens.iter().any(|t| *t == "no-outio"),
+                        },
+                        _ => return Err("`native <name>` needs `hal` or `vpio`".to_string()),
+                    };
+                Step::Native { name, kind }
+            }
             "probe" => match tokens.get(1) {
                 Some(&"on") => Step::Probe(ProbeAction::On),
                 Some(&"off") => Step::Probe(ProbeAction::Off),
@@ -677,6 +753,13 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
         steps.push(step);
     }
     Ok(steps)
+}
+
+/// A capture client set up natively rather than through cubeb.
+struct Native {
+    name: String,
+    probe: InputProbe,
+    meter: Arc<Meter>,
 }
 
 /// One `measure` step: what was live, what it was for, and what each source received.
@@ -758,11 +841,9 @@ extern "C" fn state_callback(_stream: *mut cubeb_stream, user_ptr: *mut c_void, 
 struct Runner {
     ctx: *mut cubeb,
     streams: Vec<Stream>,
-    probe: Option<InputProbe>,
-    probe_meter: Arc<Meter>,
+    natives: Vec<Native>,
     device: u32,
     device_uid: CString,
-    output_device: Option<u32>,
     output_device_uid: Option<CString>,
     rate: u32,
     channels: u32,
@@ -803,6 +884,20 @@ impl Runner {
             None => default_input_device().expect("no default input device"),
         };
         let device_uid = CString::new(device_uid(device).expect("device has no UID")).unwrap();
+        // Report the allocator in effect: a run built with --features zeroing-alloc is otherwise
+        // indistinguishable from a default one in the output, which makes pasted results ambiguous.
+        println!(
+            "Allocator: {}{}",
+            if cfg!(feature = "zeroing-alloc") {
+                "Rust allocations zeroed (--features zeroing-alloc)"
+            } else {
+                "Rust default, not zeroed"
+            },
+            match std::env::var("DYLD_INSERT_LIBRARIES") {
+                Ok(libs) if !libs.is_empty() => format!(", DYLD_INSERT_LIBRARIES={}", libs),
+                _ => ", no DYLD_INSERT_LIBRARIES".to_string(),
+            }
+        );
         println!("Requesting {} Hz, {} ch for the cubeb streams", args.rate, args.channels);
 
         // Duplex streams need an output device. Naming it explicitly matters here: with the
@@ -843,11 +938,9 @@ impl Runner {
         Self {
             ctx,
             streams: Vec::new(),
-            probe: None,
-            probe_meter: Arc::new(Meter::new("probe")),
+            natives: Vec::new(),
             device,
             device_uid,
-            output_device,
             output_device_uid,
             rate: args.rate,
             channels: args.channels,
@@ -875,6 +968,11 @@ impl Runner {
             Step::Start(name) => self.set_running(&name, true),
             Step::Params { name, params, spec } => self.set_params(&name, params, &spec),
             Step::Probe(action) => self.set_probe(action),
+            Step::Native { name, kind } => self.open_native(name, kind),
+            Step::NativeOff(name) => {
+                println!("[{:6.1}s] native off {}", self.elapsed(), name);
+                self.natives.retain(|n| n.name != name);
+            }
             Step::Tone { name, on } => {
                 println!(
                     "[{:6.1}s] tone {} {}",
@@ -897,8 +995,8 @@ impl Runner {
             Step::Note(text) => self.pending_note = Some(text),
             Step::Volume(scalar) => self.volume(scalar),
             Step::ProbeUnitVolume { value, element } => {
-                let result = match self.probe.as_ref() {
-                    Some(probe) => probe.set_unit_volume(value, element),
+                let result = match self.natives.iter().find(|n| n.name == "probe") {
+                    Some(native) => native.probe.set_unit_volume(value, element),
                     None => {
                         println!("[{:6.1}s] probevol: no probe running", self.elapsed());
                         return;
@@ -1155,29 +1253,68 @@ impl Runner {
     fn set_probe(&mut self, action: ProbeAction) {
         println!("[{:6.1}s] probe {:?}", self.elapsed(), action);
         if action == ProbeAction::Off {
-            self.probe = None;
+            self.natives.retain(|n| n.name != "probe");
             return;
         }
         if action == ProbeAction::Restart {
-            self.probe = None;
-        } else if self.probe.is_some() {
+            self.natives.retain(|n| n.name != "probe");
+        } else if self.natives.iter().any(|n| n.name == "probe") {
             println!("    probe already running");
             return;
         }
-        match InputProbe::new(self.device, self.probe_meter.clone()) {
+        self.open_native("probe".to_string(), ProbeKind::Hal);
+    }
+
+    /// Open a capture client set up natively, without cubeb. The plain kind stands in for another
+    /// app on the same device; the VPIO kind separates what Apple's voice processing does from what
+    /// cubeb's configuration of it does.
+    fn open_native(&mut self, name: String, kind: ProbeKind) {
+        let description = match kind {
+            ProbeKind::Hal => "plain CoreAudio client, no cubeb".to_string(),
+            ProbeKind::Vpio {
+                params,
+                rate,
+                disable_output_io,
+            } => format!(
+                "native VPIO, no cubeb, params {}{}{}",
+                match params {
+                    Some(p) => describe_params(p),
+                    None => "left at the unit's defaults".to_string(),
+                },
+                match rate {
+                    Some(rate) => format!(", format rate set to {} as WebKit does", rate),
+                    None => ", format left as the unit advertises it".to_string(),
+                },
+                if disable_output_io {
+                    ", output IO disabled as cubeb does"
+                } else {
+                    ", output IO untouched as WebKit does"
+                }
+            ),
+        };
+        if name != "probe" {
+            println!("[{:6.1}s] native {} ({})", self.elapsed(), name, description);
+        }
+        if self.natives.iter().any(|n| n.name == name) {
+            println!("    [{}] already running", name);
+            return;
+        }
+        let meter = Arc::new(Meter::new(name.clone()));
+        match InputProbe::with_kind(self.device, meter.clone(), kind) {
             Ok(probe) => {
                 if let Err(e) = probe.start() {
-                    println!("    WARNING: could not start probe: {}", e);
+                    println!("    WARNING: could not start {}: {}", name, e);
                     return;
                 }
                 println!(
-                    "    plain CoreAudio capture client running at {} Hz, {} ch",
+                    "    {} running at {} Hz, {} ch",
+                    description,
                     probe.rate(),
                     probe.channels()
                 );
-                self.probe = Some(probe);
+                self.natives.push(Native { name, probe, meter });
             }
-            Err(e) => println!("    WARNING: could not create probe: {}", e),
+            Err(e) => println!("    WARNING: could not create {}: {}", name, e),
         }
     }
 
@@ -1219,9 +1356,7 @@ impl Runner {
         // is capturing, so a step number is never the only thing identifying a measurement.
         let description = self.pending_note.take().unwrap_or_else(|| {
             let mut live: Vec<String> = self.streams.iter().map(|s| s.name.clone()).collect();
-            if self.probe.is_some() {
-                live.push("probe".to_string());
-            }
+            live.extend(self.natives.iter().map(|n| n.name.clone()));
             if live.is_empty() {
                 "nothing capturing".to_string()
             } else {
@@ -1242,45 +1377,61 @@ impl Runner {
             .iter()
             .map(|s| (s.name.clone(), s.meter.snapshot()))
             .collect();
-        if self.probe.is_some() {
-            before.push(("probe".to_string(), self.probe_meter.snapshot()));
-        }
+        before.extend(
+            self.natives
+                .iter()
+                .map(|n| (n.name.clone(), n.meter.snapshot())),
+        );
 
         thread::sleep(duration);
 
         let mut rows = Vec::new();
         for (name, snapshot) in &before {
-            let meter = if name == "probe" {
-                &self.probe_meter
-            } else {
-                &self
-                    .streams
-                    .iter()
-                    .find(|s| &s.name == name)
-                    .expect("stream vanished mid-measurement")
-                    .meter
+            let meter = match self.natives.iter().find(|n| &n.name == name) {
+                Some(native) => &native.meter,
+                None => {
+                    &self
+                        .streams
+                        .iter()
+                        .find(|s| &s.name == name)
+                        .expect("stream vanished mid-measurement")
+                        .meter
+                }
             };
             let report = snapshot.delta(&meter.snapshot());
-            let spec = self
-                .streams
-                .iter()
-                .find(|s| &s.name == name)
-                .map(|s| s.spec.text.clone())
-                .unwrap_or_else(|| "plain CoreAudio client, no cubeb".to_string());
+            let spec = match self.streams.iter().find(|s| &s.name == name) {
+                Some(stream) => stream.spec.text.clone(),
+                None => match self
+                    .natives
+                    .iter()
+                    .find(|n| &n.name == name)
+                    .map(|n| n.probe.kind())
+                {
+                    Some(ProbeKind::Vpio { params, .. }) => format!(
+                        "native VPIO, no cubeb, params {}",
+                        match params {
+                            Some(p) => describe_params(p),
+                            None => "unit defaults".to_string(),
+                        }
+                    ),
+                    _ => "plain CoreAudio client, no cubeb".to_string(),
+                },
+            };
             println!("    {:<10} {}", name, report);
             println!("    {:<10} └─ {}", "", spec);
             rows.push((name.clone(), spec, report));
-            if name == "probe" {
-                // The probe's client format was fixed when it was created. If the device has since
+            if let Some(native) = self.natives.iter().find(|n| &n.name == name) {
+                // A native client's format was fixed when it was created. If the device has since
                 // changed its channel count, the HAL is converting, and comparing this level to a
                 // measurement from before the change is not apples to apples.
-                if let (Some(probe), Some(now)) = (self.probe.as_ref(), input_channels(self.device))
-                {
-                    if now as usize != probe.channels() {
+                if let Some(now) = input_channels(self.device) {
+                    if now as usize != native.probe.channels()
+                        && native.probe.kind() == ProbeKind::Hal
+                    {
                         println!(
                             "    {:<10} └─ NOTE: device now has {} input channels but the probe was \
                              opened with {}; the HAL is converting",
-                            "", now, probe.channels()
+                            "", now, native.probe.channels()
                         );
                     }
                 }
@@ -1324,7 +1475,7 @@ impl Runner {
         for name in names {
             self.close(&name);
         }
-        self.probe = None;
+        self.natives.clear();
 
         if !self.results.is_empty() {
             println!("\nSummary (rms of the loudest channel, dBFS):");
