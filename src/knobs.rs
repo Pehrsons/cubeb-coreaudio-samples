@@ -320,6 +320,48 @@ pub fn describe_units(device: AudioDeviceID) -> String {
     out
 }
 
+/// The device's input volume, as a scalar in 0..1, and its decibel equivalent.
+pub fn get_input_volume(device: AudioDeviceID) -> Option<(f32, f32)> {
+    let scalar = get_property_scoped::<f32>(
+        device,
+        kAudioDevicePropertyVolumeScalar,
+        kAudioObjectPropertyScopeInput,
+    )
+    .ok()?;
+    let db = get_property_scoped::<f32>(
+        device,
+        kAudioDevicePropertyVolumeDecibels,
+        kAudioObjectPropertyScopeInput,
+    )
+    .unwrap_or(f32::NAN);
+    Some((scalar, db))
+}
+
+/// Set the device's input volume. This is the system input slider, i.e. user-visible state, so
+/// callers are expected to put it back.
+pub fn set_input_volume(device: AudioDeviceID, scalar: f32) -> Result<(), OSStatus> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyVolumeScalar,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain,
+    };
+    let status = unsafe {
+        AudioObjectSetPropertyData(
+            device,
+            &address,
+            0,
+            ptr::null(),
+            mem::size_of::<f32>() as u32,
+            &scalar as *const f32 as *const c_void,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(status)
+    }
+}
+
 fn control_class_name(class: AudioClassID) -> String {
     #[allow(non_upper_case_globals)]
     match class {

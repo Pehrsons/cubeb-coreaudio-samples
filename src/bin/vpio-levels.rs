@@ -17,6 +17,7 @@ use cubeb_coreaudio_samples::devinfo::{
     default_input_device, default_output_device, device_name, device_uid, input_channels,
     input_devices, output_devices, resolve_input_device, resolve_output_device, DeviceSnapshot,
 };
+use cubeb_coreaudio_samples::knobs;
 use cubeb_coreaudio_samples::meter::{fmt_dbfs, Meter, Report, Snapshot};
 use cubeb_coreaudio_samples::probe::InputProbe;
 use std::ffi::{c_char, c_void, CString};
@@ -332,6 +333,8 @@ Steps, separated by ';':
                         canceller something to cancel.
   note <text>           Describe what the next measurement is for, and what to expect. Shown
                         with that measurement and in the closing summary.
+  volume <scalar|?>     Read, or set, the device's input volume (the system input slider). The
+                        original value is restored when the run ends.
   measure [secs]        Capture for a while and report levels for everything live.
   sleep <secs>          Wait without reporting (e.g. past the 10s VPIO idle timeout).
   devinfo               Dump the input device's CoreAudio properties.
@@ -358,6 +361,7 @@ enum Step {
     },
     Measure(Option<f64>),
     Note(String),
+    Volume(Option<f32>),
     Sleep(f64),
     DevInfo,
 }
@@ -552,6 +556,14 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                 };
                 Step::Tone { name, on }
             }
+            "volume" => match tokens.get(1) {
+                Some(&"?") | None => Step::Volume(None),
+                Some(value) => Step::Volume(Some(
+                    value
+                        .parse::<f32>()
+                        .map_err(|e| format!("bad volume: {}", e))?,
+                )),
+            },
             "note" => Step::Note(tokens[1..].join(" ")),
             "devinfo" => Step::DevInfo,
             other => return Err(format!("Unknown step \"{}\"", other)),
@@ -656,6 +668,8 @@ struct Runner {
     results: Vec<Measurement>,
     /// Set by a `note` step, consumed by the next measurement.
     pending_note: Option<String>,
+    /// The device's input volume as found, restored on the way out since it is user-visible state.
+    original_volume: Option<f32>,
     step: usize,
 }
 
@@ -737,6 +751,7 @@ impl Runner {
             last_device_snapshot: snapshot,
             results: Vec::new(),
             pending_note: None,
+            original_volume: None,
             step: 0,
         }
     }
@@ -774,6 +789,7 @@ impl Runner {
                 thread::sleep(Duration::from_secs_f64(secs));
             }
             Step::Note(text) => self.pending_note = Some(text),
+            Step::Volume(scalar) => self.volume(scalar),
             Step::DevInfo => {
                 let snapshot = DeviceSnapshot::capture(self.device);
                 println!("[{:6.1}s] device state:\n{}", self.elapsed(), snapshot.describe());
@@ -999,6 +1015,39 @@ impl Runner {
         }
     }
 
+    fn volume(&mut self, scalar: Option<f32>) {
+        let current = knobs::get_input_volume(self.device);
+        match (scalar, current) {
+            (_, None) => {
+                println!("[{:6.1}s] volume: device exposes no input volume control", self.elapsed())
+            }
+            (None, Some((scalar, db))) => {
+                println!("[{:6.1}s] volume is {} ({:.2} dB)", self.elapsed(), scalar, db)
+            }
+            (Some(target), Some((scalar, db))) => {
+                if self.original_volume.is_none() {
+                    self.original_volume = Some(scalar);
+                }
+                match knobs::set_input_volume(self.device, target) {
+                    Ok(()) => {
+                        let now = knobs::get_input_volume(self.device);
+                        println!(
+                            "[{:6.1}s] volume {} ({:.2} dB) -> {}",
+                            self.elapsed(),
+                            scalar,
+                            db,
+                            now.map(|(s, d)| format!("{} ({:.2} dB)", s, d))
+                                .unwrap_or_else(|| "unknown".to_string())
+                        );
+                    }
+                    Err(e) => {
+                        println!("[{:6.1}s] volume: could not set (err {})", self.elapsed(), e)
+                    }
+                }
+            }
+        }
+    }
+
     fn measure(&mut self, duration: Duration) {
         // A `note` step says what this measurement is for. Without one, fall back to listing what
         // is capturing, so a step number is never the only thing identifying a measurement.
@@ -1097,6 +1146,14 @@ impl Runner {
     }
 
     fn finish(&mut self) {
+        if let Some(scalar) = self.original_volume.take() {
+            match knobs::set_input_volume(self.device, scalar) {
+                Ok(()) => println!("Restored the device input volume to {}", scalar),
+                Err(e) => {
+                    println!("WARNING: could not restore input volume to {} (err {})", scalar, e)
+                }
+            }
+        }
         let names: Vec<String> = self.streams.iter().map(|s| s.name.clone()).collect();
         for name in names {
             self.close(&name);
