@@ -14,8 +14,9 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 use cubeb_backend::ffi::*;
 use cubeb_coreaudio_samples::devinfo::{
-    default_input_device, default_output_device, device_name, device_uid, input_channels,
-    input_devices, output_devices, resolve_input_device, resolve_output_device, DeviceSnapshot,
+    cubeb_input_channel_count, default_input_device, default_output_device, device_name,
+    device_uid, input_channels, input_devices, output_devices, resolve_input_device,
+    resolve_output_device, DeviceSnapshot,
 };
 use cubeb_coreaudio_samples::knobs;
 use cubeb_coreaudio_samples::meter::{fmt_dbfs, Meter, Report, Snapshot};
@@ -353,14 +354,15 @@ fn scenario_listing(scripts: bool) -> String {
 
 const STEP_HELP: &str = "\
 Steps, separated by ';':
-  open <name> [voice] [duplex] [proc|aec|ns|agc|none] [tone] [in=<dev>] [out=<dev>]
+  open <name> [voice] [duplex] [proc|aec|ns|agc|none] [tone] [in=<dev>] [out=<dev>] [ch=<n>]
                         Create and start a stream. `voice` sets CUBEB_STREAM_PREF_VOICE,
                         `duplex` adds an output side, `proc` is AEC+NS+AGC, `none` sets the
                         processing params explicitly to none (VPIO bypass), and `tone` plays
                         a {tone_hz} Hz tone on the output side.
                         `in=`/`out=` override this run's devices for that stream, to point a
                         recycled VPIO unit at a device it was not configured for. `out=` implies
-                        duplex.
+                        duplex. `ch=` overrides --channels for that stream, so a mono and a
+                        stereo request can be compared in one window.
   close <name>          Stop and destroy a stream.
   stop <name> / start <name>
                         Stop or restart a stream without destroying it. Processing params set
@@ -437,6 +439,9 @@ struct StreamSpec {
     /// than the one it was last configured for.
     input: Option<String>,
     output: Option<String>,
+    /// Per-stream channel count, overriding --channels. Asking for 2 where cubeb would otherwise
+    /// downmix to 1 shows whether that downmix is costing level.
+    channels: Option<u32>,
     /// `None` means the stream never sets processing params, like a cubeb client that doesn't care.
     params: Option<cubeb_input_processing_params>,
     text: String,
@@ -491,6 +496,7 @@ fn parse_stream_spec(tokens: &[&str], raw: &str) -> Result<StreamSpec, String> {
         tone: false,
         input: None,
         output: None,
+        channels: None,
         params: None,
         text: String::new(),
     };
@@ -499,6 +505,13 @@ fn parse_stream_spec(tokens: &[&str], raw: &str) -> Result<StreamSpec, String> {
             "voice" => spec.voice = true,
             "duplex" => spec.duplex = true,
             "tone" => spec.tone = true,
+            token if token.starts_with("ch=") => {
+                spec.channels = Some(
+                    token["ch=".len()..]
+                        .parse::<u32>()
+                        .map_err(|e| format!("bad channel count: {}", e))?,
+                )
+            }
             token if token.starts_with("in=") => {
                 spec.input = Some(token["in=".len()..].to_string())
             }
@@ -517,6 +530,9 @@ fn parse_stream_spec(tokens: &[&str], raw: &str) -> Result<StreamSpec, String> {
     }
     if let Some(device) = &spec.output {
         spec.text = format!("{}out={} ", spec.text, device);
+    }
+    if let Some(channels) = spec.channels {
+        spec.text = format!("{}ch={} ", spec.text, channels);
     }
     spec.text = format!(
         "{}{}, {}, params {}",
@@ -926,11 +942,24 @@ impl Runner {
         }
         assert!(!self.streams.iter().any(|s| s.name == name), "duplicate stream name");
 
+        let channels = spec.channels.unwrap_or(self.channels);
+        // cubeb rejects a request for more channels than it counts on the device, and with the
+        // audio-dump feature its teardown path then asserts and aborts the process, so check first.
+        if let Some(available) = cubeb_input_channel_count(self.device) {
+            if channels > available {
+                println!(
+                    "    [{}] SKIPPED: asked for {} channels but cubeb counts {} on this device, \
+                     which would fail stream_init",
+                    name, channels, available
+                );
+                return;
+            }
+        }
         let meter = Arc::new(Meter::new(name.clone()));
         let mut ctx = Box::new(StreamCtx {
             name: name.clone(),
             meter: meter.clone(),
-            channels: self.channels as usize,
+            channels: channels as usize,
             rate: self.rate,
             tone: AtomicBool::new(spec.tone),
             phase: 0.0,
@@ -942,10 +971,10 @@ impl Runner {
             CUBEB_STREAM_PREF_NONE
         };
         let mut input_params = cubeb_stream_params {
-            channels: self.channels,
+            channels,
             format: CUBEB_SAMPLE_FLOAT32NE,
             rate: self.rate,
-            layout: if self.channels == 1 {
+            layout: if channels == 1 {
                 CUBEB_LAYOUT_MONO
             } else {
                 CUBEB_LAYOUT_UNDEFINED

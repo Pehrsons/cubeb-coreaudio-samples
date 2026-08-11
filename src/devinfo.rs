@@ -51,6 +51,40 @@ pub fn input_channels(device: AudioDeviceID) -> Option<u32> {
     .map(|format| format.mChannelsPerFrame)
 }
 
+/// The input channel count the way cubeb-coreaudio counts it (`get_channel_count`): one per
+/// stream for a device the VPIO forcelist covers, since a VPIO unit is mono, otherwise the sum of
+/// the streams' virtual formats. Requesting more channels than this makes cubeb's stream_init
+/// fail with InvalidParameter.
+pub fn cubeb_input_channel_count(device: AudioDeviceID) -> Option<u32> {
+    let streams = get_list_property_scoped::<AudioStreamID>(
+        device,
+        kAudioDevicePropertyStreams,
+        kAudioObjectPropertyScopeInput,
+    )
+    .ok()?;
+    let forcelisted = cfg!(feature = "vpio-forcelist")
+        && get_property_scoped::<u32>(
+            device,
+            kAudioDevicePropertyTransportType,
+            kAudioObjectPropertyScopeGlobal,
+        ) == Ok(kAudioDeviceTransportTypeBuiltIn);
+    let mut count = 0;
+    for stream in streams {
+        if forcelisted {
+            count += 1;
+        } else {
+            count += get_property_scoped::<AudioStreamBasicDescription>(
+                stream,
+                kAudioStreamPropertyVirtualFormat,
+                kAudioObjectPropertyScopeGlobal,
+            )
+            .map(|f| f.mChannelsPerFrame)
+            .unwrap_or(0);
+        }
+    }
+    Some(count)
+}
+
 pub fn default_output_device() -> Option<AudioDeviceID> {
     match crate::get_property::<AudioObjectID>(
         kAudioObjectSystemObject,

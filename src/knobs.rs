@@ -281,6 +281,37 @@ pub fn describe_units(device: AudioDeviceID) -> String {
         };
         unsafe { AudioUnitInitialize(unit) };
 
+        // The format the unit reports on the input bus is what cubeb adopts for the device side
+        // (mod.rs reads kAudioUnitScope_Output of the input bus for a VPIO unit). If that comes
+        // back as 2 channels while the client asked for mono, cubeb's BufferManager averages the
+        // pair, which halves the level when only one of them carries signal.
+        for (scope, label) in [
+            (kAudioUnitScope_Output, "output scope of the input bus, what cubeb reads"),
+            (kAudioUnitScope_Input, "input scope of the input bus"),
+        ] {
+            let mut desc = AudioStreamBasicDescription::default();
+            let mut size = mem::size_of::<AudioStreamBasicDescription>() as u32;
+            let status = unsafe {
+                AudioUnitGetProperty(
+                    unit,
+                    kAudioUnitProperty_StreamFormat,
+                    scope,
+                    AU_IN_BUS,
+                    &mut desc as *mut AudioStreamBasicDescription as *mut c_void,
+                    &mut size,
+                )
+            };
+            let _ = if status == 0 {
+                writeln!(
+                    out,
+                    "      format, {}: {} Hz, {} ch, {} bit",
+                    label, desc.mSampleRate, desc.mChannelsPerFrame, desc.mBitsPerChannel
+                )
+            } else {
+                writeln!(out, "      format, {}: unavailable (err {})", label, status)
+            };
+        }
+
         describe_unit_parameters(unit, &mut out);
 
         if sub_type == kAudioUnitSubType_VoiceProcessingIO {
