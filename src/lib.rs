@@ -12,6 +12,8 @@ pub mod devinfo;
 pub mod knobs;
 pub mod meter;
 pub mod probe;
+#[cfg(feature = "zeroing-alloc")]
+pub mod zeroing;
 
 /// Read a `CFStringRef` into an owned String.
 pub fn string_from_cfstringref(string_ref: CFStringRef) -> String {

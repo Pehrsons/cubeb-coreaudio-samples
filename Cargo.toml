@@ -16,6 +16,9 @@ cubeb-coreaudio = { git = "https://github.com/mozilla/cubeb-coreaudio-rs", rev =
 # that does not force VPIO for the built-in mic.
 default = ["vpio-forcelist"]
 vpio-forcelist = ["cubeb-coreaudio/vpio-forcelist"]
+# Zero every Rust allocation, to test whether a behaviour depends on reading uninitialized memory.
+# Only covers allocations made by Rust; see src/zeroing_malloc.c for the process-wide version.
+zeroing-alloc = []
 
 [dependencies.clap]
 features = ["derive"]
