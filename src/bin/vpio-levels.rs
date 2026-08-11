@@ -1186,12 +1186,27 @@ impl Runner {
                     "\n  measurement {} @ {:.1}s ── {}",
                     measurement.index, measurement.elapsed, measurement.description
                 );
+                // The room is never perfectly steady, so when a plain client is running alongside,
+                // its level is the reference that makes rows comparable across measurements.
+                let reference = measurement
+                    .rows
+                    .iter()
+                    .find(|(name, _, _)| name == "probe")
+                    .map(|(_, _, report)| report.loudest().1)
+                    .filter(|rms| rms.is_finite());
                 for (name, spec, report) in &measurement.rows {
                     let (_, rms) = report.loudest();
+                    let delta = match (reference, name.as_str()) {
+                        (Some(reference), name) if name != "probe" && rms.is_finite() => {
+                            format!("{:+.1} vs probe", rms - reference)
+                        }
+                        _ => String::new(),
+                    };
                     println!(
-                        "    {:<10} {:>8}  {:<16} {}",
+                        "    {:<10} {:>8} {:>14}  {:<16} {}",
                         name,
                         fmt_dbfs(rms),
+                        delta,
                         if report.frames == 0 {
                             "no input".to_string()
                         } else if report.digital_silence() {
