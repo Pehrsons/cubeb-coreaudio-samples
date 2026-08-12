@@ -9,6 +9,12 @@
   MediaStreamTrack.getSettings(), which is the interesting part when comparing: the same constraints
   do not produce the same platform configuration across browsers.
 
+  It can also dump the captured audio to a WAV file for external analysis, defaulting to 32-bit float
+  because that is exactly what the page received: no scaling, no clipping of samples above full scale,
+  no dither, so a level measured from the file matches the one measured live. The filename and a
+  comment chunk inside the file record the browser, the requested constraints and what the browser
+  actually applied, so three dumps from three browsers stay identifiable.
+
   Measurement is in an AudioWorklet rather than an AnalyserNode. AnalyserNode downmixes to mono and
   only exposes the most recent fftSize samples, so it can neither report per-channel levels nor
   average over a window longer than about 40 ms. The worklet accumulates per-channel sums per render
@@ -79,6 +85,24 @@
   <button id="reset">Reset peaks</button>
 </fieldset>
 
+<fieldset>
+  <legend>Dump to WAV</legend>
+  <label>Format
+    <select id="depth">
+      <option value="32">32-bit float</option>
+      <option value="16">16-bit PCM</option>
+    </select>
+  </label>
+  <button id="record" disabled>Record</button>
+  <span id="recorded" class="hint"></span>
+  <div class="hint">
+    32-bit float is exactly what the page received: no scaling, no clipping above full scale, no
+    dither, so a level measured from the file matches the one measured live. The recording is held in
+    memory until stopped, at about 11 MB per minute per channel, and downloads when stopped. The
+    filename and a comment inside the file record the browser, the constraints and the rate.
+  </div>
+</fieldset>
+
 <div id="status">Not capturing.</div>
 
 <table>
@@ -102,6 +126,10 @@
 // The worklet, as source text: JSFiddle has nowhere to put a separate module file, so it is loaded
 // through a blob URL.
 const PROCESSOR_SOURCE = `
+// Recorded audio leaves the worklet in batches of about this many frames, rather than one message
+// per render quantum, which would be a few hundred messages a second.
+const RECORD_BATCH_FRAMES = 12288;
+
 class LevelProcessor extends AudioWorkletProcessor {
   constructor(options) {
     super();
@@ -109,6 +137,9 @@ class LevelProcessor extends AudioWorkletProcessor {
     this.updateHz = options.processorOptions.updateHz;
     this.channels = 0;
     this.framesSincePost = 0;
+    this.recording = false;
+    this.batch = null;
+    this.batchFill = 0;
     this.port.onmessage = (event) => {
       if (event.data.windowSeconds !== undefined) {
         this.windowSeconds = event.data.windowSeconds;
@@ -117,7 +148,42 @@ class LevelProcessor extends AudioWorkletProcessor {
       if (event.data.updateHz !== undefined) {
         this.updateHz = event.data.updateHz;
       }
+      if (event.data.record !== undefined) {
+        this.recording = event.data.record;
+        if (!this.recording) {
+          this.flush();                 // whatever is left of the last partial batch
+          this.batch = null;
+          // Ordered after the flush on the same port, so the main thread knows the recording is
+          // complete and is not encoding without its last fraction of a second.
+          this.port.postMessage({ recordingStopped: true });
+        }
+      }
     };
+  }
+
+  // Sends the batch on and starts a new one. The buffers are transferred rather than copied, so the
+  // audio thread hands them over without the structured clone.
+  flush() {
+    if (!this.batch || this.batchFill === 0) {
+      return;
+    }
+    const buffers = [];
+    for (let c = 0; c < this.batch.length; c++) {
+      buffers.push(this.batch[c].slice(0, this.batchFill));
+    }
+    this.port.postMessage(
+      { recorded: buffers, frames: this.batchFill, sampleRate },
+      buffers.map((b) => b.buffer)
+    );
+    this.startBatch(this.batch.length);
+  }
+
+  startBatch(channels) {
+    this.batch = [];
+    for (let c = 0; c < channels; c++) {
+      this.batch.push(new Float32Array(RECORD_BATCH_FRAMES));
+    }
+    this.batchFill = 0;
   }
 
   // One slot per render quantum. Sized from the window length, so changing the window reallocates.
@@ -179,6 +245,20 @@ class LevelProcessor extends AudioWorkletProcessor {
     }
     this.write = (slot + 1) % this.capacity;
 
+    if (this.recording) {
+      // The input arrays are reused between calls, so these have to be copies.
+      if (!this.batch || this.batch.length !== this.channels) {
+        this.startBatch(this.channels);
+      }
+      if (this.batchFill + frames > RECORD_BATCH_FRAMES) {
+        this.flush();
+      }
+      for (let c = 0; c < this.channels; c++) {
+        this.batch[c].set(input[c], this.batchFill);
+      }
+      this.batchFill += frames;
+    }
+
     // Window peak is a max over the ring, which cannot be maintained incrementally the way the sum
     // can. Recomputing it only when posting keeps that off the audio thread's hot path.
     this.framesSincePost += frames;
@@ -216,6 +296,74 @@ registerProcessor("level-processor", LevelProcessor);
 
 const BAR_FLOOR = -80;
 
+// Encodes recorded audio as a WAV file. `channels` is one flat Float32Array per channel.
+//
+// 32-bit float is the default because it is what the worklet received: no scaling, no clipping of
+// samples above full scale, and no dither decision, so a level measured from the file matches a
+// level measured live. 16-bit is there for tools that will not read float WAV.
+//
+// The comment goes in a LIST/INFO/ICMT chunk, which is standard and which ffprobe and friends print,
+// so a file dropped in a directory next to two others still says which browser and which constraints
+// produced it.
+function encodeWav(channels, frames, sampleRate, bitDepth, comment) {
+  const isFloat = bitDepth === 32;
+  const bytesPerSample = isFloat ? 4 : 2;
+  const blockAlign = channels.length * bytesPerSample;
+  const dataSize = frames * blockAlign;
+
+  const commentBytes = new TextEncoder().encode(comment + "\0");
+  // Every chunk's payload is padded to an even length.
+  const commentPadded = commentBytes.length + (commentBytes.length % 2);
+  const listSize = 4 + 8 + commentPadded;            // "INFO", then the ICMT chunk
+
+  const buffer = new ArrayBuffer(12 + 8 + 16 + 8 + listSize + 8 + dataSize);
+  const view = new DataView(buffer);
+  let at = 0;
+  const u32 = (value) => { view.setUint32(at, value, true); at += 4; };
+  const u16 = (value) => { view.setUint16(at, value, true); at += 2; };
+  const tag = (text) => { for (const ch of text) { view.setUint8(at++, ch.charCodeAt(0)); } };
+
+  tag("RIFF");
+  u32(buffer.byteLength - 8);
+  tag("WAVE");
+
+  tag("fmt ");
+  u32(16);
+  u16(isFloat ? 3 : 1);                              // 3 is IEEE float, 1 is integer PCM
+  u16(channels.length);
+  u32(sampleRate);
+  u32(sampleRate * blockAlign);
+  u16(blockAlign);
+  u16(bitDepth);
+
+  tag("LIST");
+  u32(listSize);
+  tag("INFO");
+  tag("ICMT");
+  u32(commentBytes.length);
+  new Uint8Array(buffer, at, commentBytes.length).set(commentBytes);
+  at += commentPadded;
+
+  tag("data");
+  u32(dataSize);
+  for (let i = 0; i < frames; i++) {
+    for (let c = 0; c < channels.length; c++) {
+      const sample = channels[c][i];
+      if (isFloat) {
+        view.setFloat32(at, sample, true);
+        at += 4;
+      } else {
+        // Asymmetric scaling, so that -1.0 and +1.0 both land inside the 16-bit range.
+        const clamped = Math.max(-1, Math.min(1, sample));
+        view.setInt16(at, Math.round(clamped * (clamped < 0 ? 32768 : 32767)), true);
+        at += 2;
+      }
+    }
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
 const ui = {
   device: document.getElementById("device"),
   ec: document.getElementById("ec"),
@@ -225,6 +373,9 @@ const ui = {
   rate: document.getElementById("rate"),
   toggle: document.getElementById("toggle"),
   reset: document.getElementById("reset"),
+  record: document.getElementById("record"),
+  depth: document.getElementById("depth"),
+  recorded: document.getElementById("recorded"),
   status: document.getElementById("status"),
   rows: document.getElementById("rows"),
   settings: document.getElementById("settings"),
@@ -236,6 +387,10 @@ let node = null;
 let silence = null;
 let maxRms = [];
 let maxPeak = [];
+// While recording: one array of Float32Array batches per channel, joined only at the end.
+let recording = null;
+// Set while waiting for the worklet to acknowledge that it has flushed.
+let recordingStopped = null;
 
 function dbfs(amplitude) {
   return amplitude > 0 ? 20 * Math.log10(amplitude) : -Infinity;
@@ -280,6 +435,157 @@ function renderRows(rms, peak) {
     fill.style.width = Math.max(0, Math.min(100, ((db - BAR_FLOOR) / -BAR_FLOOR) * 100)) + "%";
     fill.className = dbfs(peak[c]) > -1 ? "hot" : "";
   }
+}
+
+// A guess, and only used to name the file: three dumps from three browsers in one directory are
+// otherwise hard to tell apart.
+function browserName() {
+  const ua = navigator.userAgent;
+  if (ua.includes("Firefox/")) {
+    return "firefox";
+  }
+  if (ua.includes("Chrome/") || ua.includes("Chromium/")) {
+    return "chrome";
+  }
+  if (ua.includes("Safari/")) {
+    return "safari";
+  }
+  return "browser";
+}
+
+function onRecorded(data) {
+  if (!recording) {
+    return;
+  }
+  if (recording.channels.length !== data.recorded.length) {
+    // The channel count can only change by reopening the track, which resets the recording anyway.
+    recording.channels = data.recorded.map(() => []);
+  }
+  for (let c = 0; c < data.recorded.length; c++) {
+    recording.channels[c].push(data.recorded[c]);
+  }
+  recording.frames += data.frames;
+  recording.sampleRate = data.sampleRate;
+
+  const bytes =
+    recording.frames * recording.channels.length * (Number(ui.depth.value) === 32 ? 4 : 2);
+  ui.recorded.textContent =
+    "recording " + (recording.frames / recording.sampleRate).toFixed(1) + " s, " +
+    (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+// Asks the worklet to stop and resolves once its final batch has arrived, so nothing is encoded
+// without the last fraction of a second. Resolves anyway after a moment, in case the audio thread
+// has already stopped running and the acknowledgement will never come.
+function stopRecording() {
+  if (!recording || recording.finishing) {
+    return Promise.resolve();
+  }
+  recording.finishing = true;
+  ui.record.disabled = true;
+  ui.recorded.textContent = "finishing…";
+
+  if (!node) {
+    finishRecording();
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const done = () => {
+      if (!recordingStopped) {
+        return;
+      }
+      recordingStopped = null;
+      finishRecording();
+      resolve();
+    };
+    recordingStopped = done;
+    setTimeout(done, 500);
+    node.port.postMessage({ record: false });
+  });
+}
+
+function finishRecording() {
+  if (!recording) {
+    return;
+  }
+  const state = recording;
+  recording = null;
+  ui.record.textContent = "Record";
+  ui.record.disabled = !stream;
+
+  if (state.frames === 0) {
+    ui.recorded.textContent = "nothing recorded";
+    return;
+  }
+
+  // Joining happens here rather than per batch: concatenating on every message would copy the whole
+  // recording again each time.
+  const channels = state.channels.map((batches) => {
+    const flat = new Float32Array(state.frames);
+    let at = 0;
+    for (const batch of batches) {
+      flat.set(batch, at);
+      at += batch.length;
+    }
+    return flat;
+  });
+
+  const depth = Number(ui.depth.value);
+  const name = [
+    "mic",
+    browserName(),
+    state.stamp,
+    "ec" + (state.settings.echoCancellation ? 1 : 0) +
+      "-ns" + (state.settings.noiseSuppression ? 1 : 0) +
+      "-agc" + (state.settings.autoGainControl ? 1 : 0),
+    state.sampleRate + "Hz",
+    channels.length + "ch",
+    depth === 32 ? "f32" : "s16",
+  ].join("-") + ".wav";
+
+  const comment = JSON.stringify({
+    browser: navigator.userAgent,
+    requested: state.requested,
+    applied: state.settings,
+    contextSampleRate: state.sampleRate,
+    recordedSeconds: state.frames / state.sampleRate,
+  });
+
+  const blob = encodeWav(channels, state.frames, state.sampleRate, depth, comment);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  link.click();
+  // Revoked late: Safari needs the URL to still be alive when the download starts.
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+  ui.recorded.textContent =
+    "wrote " + name + ", " + (state.frames / state.sampleRate).toFixed(1) + " s, " +
+    (blob.size / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function startRecording() {
+  if (!stream || !node) {
+    return;
+  }
+  const track = stream.getAudioTracks()[0];
+  recording = {
+    channels: [],
+    frames: 0,
+    sampleRate: context.sampleRate,
+    settings: track.getSettings(),
+    requested: {
+      echoCancellation: ui.ec.checked,
+      noiseSuppression: ui.ns.checked,
+      autoGainControl: ui.agc.checked,
+    },
+    // Local time, and filename-safe.
+    stamp: new Date().toLocaleString("sv").replace(" ", "T").replace(/:/g, ""),
+  };
+  ui.record.textContent = "Stop and download";
+  ui.recorded.textContent = "recording 0.0 s";
+  node.port.postMessage({ record: true });
 }
 
 function onLevels(data) {
@@ -371,7 +677,17 @@ async function start() {
       updateHz: Number(ui.rate.value),
     },
   });
-  node.port.onmessage = (event) => onLevels(event.data);
+  node.port.onmessage = (event) => {
+    if (event.data.recorded) {
+      onRecorded(event.data);
+    } else if (event.data.recordingStopped) {
+      if (recordingStopped) {
+        recordingStopped();
+      }
+    } else {
+      onLevels(event.data);
+    }
+  };
 
   // Rendering is driven by the destination, so a branch that does not reach it is not guaranteed to
   // be pulled -- a worklet declared with no outputs stops being called in some browsers. Routing
@@ -387,12 +703,18 @@ async function start() {
   maxRms = [];
   maxPeak = [];
   ui.toggle.textContent = "Stop";
+  ui.record.disabled = false;
   setStatus("Capturing…");
   showSettings(stream.getAudioTracks()[0]);
   await listDevices();
 }
 
 function stop() {
+  // A recording still open here is one that stopRecording() could not finish -- an error path, or a
+  // reopen from changing a constraint. Encode what arrived rather than dropping it.
+  recordingStopped = null;
+  finishRecording();
+  ui.record.disabled = true;
   if (node) {
     node.port.onmessage = null;
     node.disconnect();
@@ -416,8 +738,17 @@ function stop() {
   setStatus("Not capturing.");
 }
 
+ui.record.addEventListener("click", async () => {
+  if (recording) {
+    await stopRecording();
+  } else {
+    startRecording();
+  }
+});
+
 ui.toggle.addEventListener("click", async () => {
   if (stream) {
+    await stopRecording();          // so a dump in progress is written out complete
     stop();
     return;
   }
@@ -456,6 +787,7 @@ for (const control of [ui.device, ui.ec, ui.ns, ui.agc]) {
     if (!stream) {
       return;
     }
+    await stopRecording();
     stop();
     try {
       await start();
