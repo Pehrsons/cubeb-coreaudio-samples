@@ -146,8 +146,13 @@ included ([WebPreferencesDefaultValues.cpp](https://searchfox.org/wubkat/source/
 [UserMediaCaptureManagerProxy.cpp](https://searchfox.org/wubkat/source/Source/WebKit/GPUProcess/webrtc/UserMediaCaptureManagerProxy.cpp#567)).
 Firefox opens the mic in its main process, and Chrome in an audio helper.
 
-Two consequences. Attribution and the unit are in different processes: TCC and the Control Center mic
-mode picker name Safari, while the audio unit lives in `com.apple.WebKit.GPU`. And the reason the
+Attribution and the unit are in different processes: the GPU process has no
+`com.apple.security.device.microphone` of its own but carries
+`com.apple.tcc.delegated-services: [kTCCServiceCamera, kTCCServiceMicrophone]`, and CoreAudio
+attributes its VPIO client to `com.apple.Safari`. It is started by launchd, not by Safari — its parent
+is pid 1 — so the delegation, not process ancestry, is what carries the microphone grant across.
+
+The other consequence is that the reason the
 log comparison against Safari's setup never produced anything is likely that the GPU process's log
 lines were not reaching the stream at all — every WebKit line that did arrive was forwarded through
 the Safari UI process, which is not evidence about where the unit is.
@@ -186,9 +191,28 @@ for client with bundle id org.mozilla.vpio-levels (AVFoundation is available, ap
 client deny list, application is not FaceTime variant)
 ```
 
-so there is a bundle-ID deny list, but Safari passes this check too — it offers Voice Isolation and
-only lacks Wide Spectrum. No wide-spectrum decision is logged anywhere. Both browsers default to
-Standard, so nothing unexpected is applied to either. Treat the picker as a curiosity.
+so there is a bundle-ID deny list, and Safari passes that check too — it offers Voice Isolation and
+only lacks Wide Spectrum.
+
+Which is decided per bundle ID, by name, and logged. From the same handler during a Safari capture:
+
+```
+System_Input_Processing_Notification_Handler.mm:279  Setting hidden voice isolation DSP types for
+bundle id com.apple.Safari: [AVAUVoiceIOChatFlavorWideSpectrum]
+System_Input_Processing_Notification_Handler.mm:425  Setting supported voice isolation DSP types for
+bundle id com.apple.Safari: [AVAUVoiceIOChatFlavorStandard, AVAUVoiceIOChatFlavorVoiceIsolation]
+```
+
+macOS *hides* Wide Spectrum from Safari explicitly. So the picker difference is Apple policy keyed on
+the application, not a consequence of anything either browser does to its audio unit, and no
+configuration change on our side would reproduce or remove it. Both browsers default to Standard
+anyway, so nothing unexpected is applied to either. The picker is not a symptom.
+
+Two caveats. Our own capture logged the `is_vi_available` verdict but neither list, which fits the
+lists being logged only when something is hidden, but the two captures were not matched runs, so that
+half is consistent rather than established. And note the bundle ID CoreAudio attributes is
+`com.apple.Safari` even though the unit lives in `com.apple.WebKit.GPU` — the policy follows the
+responsible application, not the process holding the unit.
 
 ## Reliability, separate from level
 
