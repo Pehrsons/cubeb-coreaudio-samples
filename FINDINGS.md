@@ -129,6 +129,29 @@ One thing this does not establish: `MediaSessionManagerCocoa`'s category calls a
 `AudioSession::shouldManageAudioSessionCategory()`, which defaults to false, so whether shipping
 Safari has the session configured this way during a getUserMedia capture is still unverified.
 
+### Safari captures in the GPU process
+
+Measured while Safari held the microphone, by walking `kAudioHardwarePropertyProcessObjectList` and
+reading each process object's `kAudioProcessPropertyIsRunningInput`: the process with input running is
+`com.apple.WebKit.GPU`, not `com.apple.Safari`. Its input device list is the built-in mic, and the
+device reads `96000 Hz, 3 ch` — the raw array mode that only an attached VoiceProcessingIO unit
+forces, which is independent confirmation that Safari is on VPIO. Its output was running on the
+built-in speakers at the same time, consistent with VPIO's output side being left enabled, though a
+page playing audio would look the same.
+
+This matches the source: `defaultCaptureAudioInGPUProcessEnabled()` returns true under
+`ENABLE(GPU_PROCESS_BY_DEFAULT)`, which `PlatformEnableCocoa.h` defines unconditionally, so macOS
+included ([WebPreferencesDefaultValues.cpp](https://searchfox.org/wubkat/source/Source/WebKit/Shared/WebPreferencesDefaultValues.cpp#117),
+[PlatformEnableCocoa.h](https://searchfox.org/wubkat/source/Source/WTF/wtf/PlatformEnableCocoa.h#388),
+[UserMediaCaptureManagerProxy.cpp](https://searchfox.org/wubkat/source/Source/WebKit/GPUProcess/webrtc/UserMediaCaptureManagerProxy.cpp#567)).
+Firefox opens the mic in its main process, and Chrome in an audio helper.
+
+Two consequences. Attribution and the unit are in different processes: TCC and the Control Center mic
+mode picker name Safari, while the audio unit lives in `com.apple.WebKit.GPU`. And the reason the
+log comparison against Safari's setup never produced anything is likely that the GPU process's log
+lines were not reaching the stream at all — every WebKit line that did arrive was forwarded through
+the Safari UI process, which is not evidence about where the unit is.
+
 ## How Gecko can ask cubeb for no processing
 
 Even when a page requests `aec+ns+agc`, the shared stream can end up at
