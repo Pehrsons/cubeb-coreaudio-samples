@@ -92,6 +92,7 @@ Read from `Source/WebCore/platform/mediastream/cocoa/CoreAudioCaptureUnit.{cpp,m
 | WebKit sets the public `kAUVoiceIOProperty_OtherAudioDuckingConfiguration`; cubeb calls the private `audio_device_duck()` on `get_default_device(OUTPUT)`, which is the wrong device when the stream's output is not the system default, and once per unit creation rather than per stream | none measurable on level |
 | WebKit enables `kAudioDevicePropertyVoiceActivityDetectionEnable` and installs `kAUVoiceIOProperty_MutedSpeechActivityEventListener` | none measurable |
 | WebKit calls `AVAudioRoutingArbiter beginArbitrationWithCategory:` (`arbitration on` in the tool) | none measurable: bypass -30.0/-29.8 without, -28.8/-29.9 with |
+| WebKit sets the `AVAudioSession` category to `PlayAndRecord` with mode `VideoChat`, activates the session and declares it eligible for Bluetooth smart routing (`session videochat`, `--scenario webkit-session`) | none measurable **on M2**, where the comparison cannot come out any other way; untested where it would matter |
 | WebKit runs a watchdog, `verifyIsCapturing`, that calls `captureFailed()` when the microphone proc stops being called; cubeb has nothing equivalent | not a level difference, but see below |
 | WebKit retains a released VPIO unit for 3 s (`delayBeforeStoredVPIOUnitDeallocation`); cubeb for 10 s (`VPIO_IDLE_TIMEOUT`) | how long the device stays in raw-array mode after capture ends |
 
@@ -99,9 +100,34 @@ Nothing above the audio unit adds gain in WebKit: the only gain application is
 `applyGain(volume())` with `volume()` defaulting to 1, the outgoing WebRTC path has no gain or APM,
 and `LibWebRTCProvider::createPeerConnectionFactory` attaches no audio processing module.
 
-`AVAudioSession` is `API_UNAVAILABLE(macos)`. WebKit's log line `setting category = PlayAndRecord,
-mode = VideoChat` is bookkeeping in `AudioSessionCocoa`; the macOS path discards the mode
-(`UNUSED_PARAM(mode)`) and only performs routing arbitration.
+### The audio session is reachable on macOS, and is the one difference still open
+
+WebKit's log line `setting category = PlayAndRecord, mode = VideoChat` comes from
+`MediaSessionManagerCocoa::updateSessionState`, and the implementation under it is
+`AudioSessionCocoa::setCategory`, which `AudioSessionMac::setCategory` calls before doing its own
+arbitration. It leads to real system calls: `setEligibleForSmartRoutingInternal` calls
+`-setEligibleForBTSmartRoutingConsideration:error:` on `[AVAudioSession sharedInstance]`, and
+`tryToSetActiveInternal` calls `-setActive:withOptions:error:`. `HAVE_AVAUDIOSESSION_SMARTROUTING` is
+defined for `PLATFORM(MAC)`.
+
+The public SDK marks `AVAudioSession` `API_UNAVAILABLE(macos)` and does not declare the class at all,
+so this looks impossible — but WebKit reaches it through `pal/spi/cocoa/AVFoundationSPI.h` and
+`AVFoundationSoftLink.h`, and it works: on macOS 26.6 the class is present, `sharedInstance` returns
+an object, the category starts at `SoloAmbient`, and setting `PlayAndRecord`/`VideoChat` plus
+`setActive:YES` all succeed with no error. `session videochat` in the tool does exactly that.
+
+Measured on this M2, bypassed and processed units side by side, Δ against a plain client in the same
+window: 41.1 dB with no session, 41.2 with the category and mode set but not activated, 41.3
+activated, 41.4 with the units created after the session was already in place. So no effect —
+**but this machine has no bypass cliff to fix**, bypass already sitting 41 dB above a plain client,
+so the null result is the only result it could produce. `--scenario webkit-session` on an M3 or later
+is the test that would mean something. The processed unit drifting 41.0 → 37.4 across those same
+windows is the NS and AGC settle, not the session: the first window is the first seconds after
+start.
+
+One thing this does not establish: `MediaSessionManagerCocoa`'s category calls are gated on
+`AudioSession::shouldManageAudioSessionCategory()`, which defaults to false, so whether shipping
+Safari has the session configured this way during a getUserMedia capture is still unverified.
 
 ## How Gecko can ask cubeb for no processing
 

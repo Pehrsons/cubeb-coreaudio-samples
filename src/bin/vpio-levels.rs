@@ -34,6 +34,37 @@ extern "C" {
     /// Audio routing arbitration, which WebKit does and cubeb does not. See src/routing_arbiter.m.
     fn routing_arbiter_begin_play_and_record() -> i32;
     fn routing_arbiter_leave();
+    /// The AVAudioSession category and mode WebKit sets. See src/audio_session.m.
+    fn audio_session_configure(mode: *const c_char, activate: i32) -> i32;
+    fn audio_session_deactivate() -> i32;
+    fn audio_session_describe(
+        category: *mut c_char,
+        category_len: usize,
+        mode: *mut c_char,
+        mode_len: usize,
+    );
+}
+
+/// The session's current category and mode, for reporting what actually took effect.
+fn session_state() -> (String, String) {
+    let mut category = [0i8; 64];
+    let mut mode = [0i8; 64];
+    unsafe {
+        audio_session_describe(
+            category.as_mut_ptr(),
+            category.len(),
+            mode.as_mut_ptr(),
+            mode.len(),
+        );
+        (
+            std::ffi::CStr::from_ptr(category.as_ptr())
+                .to_string_lossy()
+                .into_owned(),
+            std::ffi::CStr::from_ptr(mode.as_ptr())
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
 }
 
 // Built with --features zeroing-alloc to test whether anything here depends on reading
@@ -144,6 +175,32 @@ const SCENARIOS: &[(&str, &str, &str)] = &[
          reports the level dropping about 5 dB a few seconds in, so compare against the window \
          above, and check whether the device volume moved on its own; \
          measure 6",
+    ),
+    (
+        "webkit-session",
+        "Whether the AVAudioSession category and mode WebKit sets -- PlayAndRecord with VideoChat \
+         -- changes what a VPIO unit captures. Worth running on an M3 or later, where a bypassed \
+         unit reads the same as a client with no voice processing at all: that is the machine where \
+         this could turn out to matter, and where a positive result would be a fix. On an M2, where \
+         bypass is already about 40 dB above a plain client, the comparison can only come out null. \
+         Bypassed and processed units are measured side by side in every window, so the two \
+         reference each other, and the session is applied in the three orders that could plausibly \
+         differ: after the units exist, category-only without activating, and with the session \
+         already in place when the units are created.",
+        "probe on; native bypass vpio none; native proc vpio proc; sleep 2; \
+         note no session, which is what cubeb does -- the reference for the three windows below; \
+         measure 10; \
+         session videochat passive; \
+         note category and mode set but the session not activated; \
+         measure 10; \
+         session videochat; \
+         note activated and declared eligible for Bluetooth smart routing, which is all of what \
+         AudioSessionCocoa::setCategory leads to; \
+         measure 10; \
+         native off bypass; native off proc; \
+         native bypass vpio none; native proc vpio proc; sleep 2; \
+         note units recreated with the session already in place, the order WebKit does it in; \
+         measure 10",
     ),
     (
         "churn",
@@ -456,6 +513,12 @@ Steps, separated by ';':
                         original value is restored when the run ends.
   arbitration on|off    Begin or leave audio routing arbitration for the play-and-record category,
                         which is what WebKit's AudioSessionMac does and cubeb never does.
+  session <mode>|off    Set the AVAudioSession play-and-record category with that mode
+                        (videochat, voicechat, default), activate it, and declare it eligible for
+                        Bluetooth smart routing -- what WebKit logs as `setting category =
+                        PlayAndRecord, mode = VideoChat`. Add `passive` to set the category and mode
+                        without activating. `off` deactivates; the category cannot be put back.
+                        The session is per process, so it affects every later step.
   probevol <v> [bus]    Set the probe unit's own Volume parameter (kHALOutputParam_Volume), to
                         test whether that per-client knob affects capture. Bus 1 by default.
   cycle <n> [spec...]   Open and immediately close a stream n times, to churn VPIO units. Note
@@ -495,6 +558,8 @@ enum Step {
     Note(String),
     Volume(Option<f32>),
     Arbitration(bool),
+    /// `Some(mode, activate)` configures the play-and-record category, `None` deactivates.
+    Session(Option<(String, bool)>),
     ProbeUnitVolume {
         value: f32,
         element: u32,
@@ -779,6 +844,21 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                 Some(&"off") => Step::Arbitration(false),
                 _ => return Err("`arbitration` needs `on` or `off`".to_string()),
             },
+            "session" => match tokens.get(1) {
+                Some(&"off") => Step::Session(None),
+                Some(mode) => {
+                    // The mode names the AVAudioSessionMode suffix, so spell it as WebKit logs it.
+                    let mode = match *mode {
+                        "videochat" => "VideoChat",
+                        "voicechat" => "VoiceChat",
+                        "default" => "Default",
+                        other => other,
+                    };
+                    let activate = tokens.get(2) != Some(&"passive");
+                    Step::Session(Some((mode.to_string(), activate)))
+                }
+                None => return Err("`session` needs a mode, or `off`".to_string()),
+            },
             "volume" => match tokens.get(1) {
                 Some(&"?") | None => Step::Volume(None),
                 Some(value) => Step::Volume(Some(
@@ -1052,6 +1132,32 @@ impl Runner {
                     unsafe { routing_arbiter_leave() };
                     println!("[{:6.1}s] arbitration off", self.elapsed());
                 }
+            }
+            Step::Session(config) => {
+                let result = match &config {
+                    Some((mode, activate)) => {
+                        let mode = CString::new(mode.as_str()).unwrap();
+                        unsafe { audio_session_configure(mode.as_ptr(), i32::from(*activate)) }
+                    }
+                    None => unsafe { audio_session_deactivate() },
+                };
+                let (category, mode) = session_state();
+                println!(
+                    "[{:6.1}s] session {}: {}, now {}/{}",
+                    self.elapsed(),
+                    match &config {
+                        Some((mode, true)) => format!("{} active", mode),
+                        Some((mode, false)) => format!("{} passive", mode),
+                        None => "off".to_string(),
+                    },
+                    match result {
+                        0 => "ok".to_string(),
+                        -1 => "AVAudioSession unavailable".to_string(),
+                        e => format!("failed, error {}", e),
+                    },
+                    category,
+                    mode
+                );
             }
             Step::ProbeUnitVolume { value, element } => {
                 let result = match self.natives.iter().find(|n| n.name == "probe") {

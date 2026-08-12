@@ -1,15 +1,10 @@
 // Audio routing arbitration, the one app-level audio call WebKit makes that cubeb does not.
 //
-// WebKit's AudioSessionMac::setCategory does two things: it records a category and mode through
-// AudioSessionCocoa, and then, under ENABLE(ROUTING_ARBITRATION), calls
-// beginRoutingArbitrationWithCategory. Only the first is visible in the log as
-//
-//     MediaSessionManagerCocoa::updateSessionState(0) setting category = PlayAndRecord,
-//         mode = VideoChat, policy = Default
-//
-// but the mode is discarded on macOS -- the macOS path reaches UNUSED_PARAM(mode) -- and
-// AVAudioSession itself is API_UNAVAILABLE(macos). So arbitration is the part that actually reaches
-// the system, and this is it.
+// WebKit's AudioSessionMac::setCategory does two things: it calls AudioSessionCocoa::setCategory,
+// which reaches AVAudioSession (see src/audio_session.m), and then, under
+// ENABLE(ROUTING_ARBITRATION), calls beginRoutingArbitrationWithCategory. This file is the second
+// half. The mode is only logged here -- beginRoutingArbitrationWithCategory takes a category and
+// nothing else -- so arbitration is category-only by construction.
 //
 // Its documented purpose is route coordination: WebKit re-arbitrates when the default device's
 // Bluetooth-ness changes and only inspects whether the default route changed. Any effect on input

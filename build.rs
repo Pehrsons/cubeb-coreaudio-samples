@@ -12,8 +12,10 @@ fn main() {
     // frameworks, not just ours. Built here so it never goes stale against the source.
     // Separate build: Objective-C, and it needs AVFAudio, which the rest does not.
     println!("cargo:rerun-if-changed=src/routing_arbiter.m");
+    println!("cargo:rerun-if-changed=src/audio_session.m");
     cc::Build::new()
         .file("src/routing_arbiter.m")
+        .file("src/audio_session.m")
         .flag("-fobjc-arc")
         .compile("routing_arbiter");
     println!("cargo:rustc-link-lib=framework=AVFAudio");
