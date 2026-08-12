@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<!--
+  A cross-browser microphone level meter, for comparing what Firefox, Safari and Chrome actually
+  capture from the same microphone in the same room.
+
+  Reports the same two numbers per channel as the vpio-levels tool in this repository -- RMS and peak
+  in dBFS over a sliding window, 1 second by default -- so a browser measurement can be put beside a
+  native one. It also shows the processing settings the browser really applied, via
+  MediaStreamTrack.getSettings(), which is the interesting part when comparing: the same constraints
+  do not produce the same platform configuration across browsers.
+
+  Measurement is in an AudioWorklet rather than an AnalyserNode. AnalyserNode downmixes to mono and
+  only exposes the most recent fftSize samples, so it can neither report per-channel levels nor
+  average over a window longer than about 40 ms. The worklet accumulates per-channel sums per render
+  quantum and keeps a ring of them, which makes the window an honest sliding window of the requested
+  length.
+
+  For JSFiddle: paste this whole file into the HTML pane, which works as-is. To use all three panes
+  instead, the <style> block is the CSS pane and the <script> block is the JS pane, minus their tags.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Microphone level meter</title>
+<style>
+  body {
+    font: 13px/1.5 -apple-system, system-ui, sans-serif;
+    margin: 16px;
+    max-width: 780px;
+  }
+  h1 { font-size: 16px; margin: 0 0 12px; }
+  fieldset { border: 1px solid #ccc; border-radius: 4px; margin: 0 0 12px; padding: 8px 12px; }
+  legend { color: #666; padding: 0 4px; }
+  label { margin-right: 12px; white-space: nowrap; }
+  button { font: inherit; padding: 4px 12px; }
+  select, input[type=number] { font: inherit; }
+  table { border-collapse: collapse; width: 100%; }
+  th { text-align: left; color: #666; font-weight: normal; }
+  th, td { padding: 2px 8px 2px 0; }
+  td.n { font-variant-numeric: tabular-nums; text-align: right; width: 5em; }
+  /* The bar is a linear map of dBFS over BAR_FLOOR..0, which exaggerates the top end. That is the
+     useful end here: the levels under comparison sit between -60 and -20 dBFS. */
+  .bar { background: #eee; border-radius: 2px; height: 12px; width: 100%; min-width: 120px; }
+  .bar > div { background: #4a8; border-radius: 2px; height: 100%; width: 0; }
+  .bar > div.hot { background: #d55; }
+  #status { color: #666; min-height: 1.5em; }
+  #status.error { color: #c00; }
+  #settings { color: #444; font-family: ui-monospace, monospace; white-space: pre-wrap; }
+  .hint { color: #888; }
+</style>
+</head>
+<body>
+
+<h1>Microphone level meter</h1>
+
+<fieldset>
+  <legend>Capture</legend>
+  <label>Device
+    <select id="device"><option value="">default</option></select>
+  </label>
+  <label><input type="checkbox" id="ec" checked> echoCancellation</label>
+  <label><input type="checkbox" id="ns" checked> noiseSuppression</label>
+  <label><input type="checkbox" id="agc" checked> autoGainControl</label>
+  <div class="hint">
+    All three on is what a typical video call requests. All three off is what a page asking for
+    unprocessed audio requests; on macOS that is the configuration the level complaints are about.
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>Measurement</legend>
+  <label>Window
+    <input type="number" id="window" value="1" min="0.05" max="30" step="0.05"> s
+  </label>
+  <label>Update
+    <input type="number" id="rate" value="10" min="1" max="60" step="1"> Hz
+  </label>
+  <button id="toggle">Start</button>
+  <button id="reset">Reset peaks</button>
+</fieldset>
+
+<div id="status">Not capturing.</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>Channel</th><th class="n">RMS</th><th class="n">Peak</th>
+      <th class="n">Max RMS</th><th class="n">Max peak</th><th style="width: 40%">RMS</th>
+    </tr>
+  </thead>
+  <tbody id="rows"></tbody>
+</table>
+
+<fieldset style="margin-top: 12px">
+  <legend>What the browser applied</legend>
+  <div id="settings">—</div>
+</fieldset>
+
+<script>
+"use strict";
+
+// The worklet, as source text: JSFiddle has nowhere to put a separate module file, so it is loaded
+// through a blob URL.
+const PROCESSOR_SOURCE = `
+class LevelProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    this.windowSeconds = options.processorOptions.windowSeconds;
+    this.updateHz = options.processorOptions.updateHz;
+    this.channels = 0;
+    this.framesSincePost = 0;
+    this.port.onmessage = (event) => {
+      if (event.data.windowSeconds !== undefined) {
+        this.windowSeconds = event.data.windowSeconds;
+        this.channels = 0;              // forces a resize on the next block
+      }
+      if (event.data.updateHz !== undefined) {
+        this.updateHz = event.data.updateHz;
+      }
+    };
+  }
+
+  // One slot per render quantum. Sized from the window length, so changing the window reallocates.
+  resize(channels) {
+    const quantum = 128;
+    this.capacity = Math.max(1, Math.ceil((this.windowSeconds * sampleRate) / quantum));
+    this.channels = channels;
+    this.frames = new Float64Array(this.capacity);
+    this.sumsq = [];
+    this.peak = [];
+    this.running = new Float64Array(channels);
+    for (let c = 0; c < channels; c++) {
+      this.sumsq.push(new Float64Array(this.capacity));
+      this.peak.push(new Float64Array(this.capacity));
+    }
+    this.write = 0;
+    this.count = 0;
+    this.totalFrames = 0;
+  }
+
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || input.length === 0 || input[0].length === 0) {
+      return true;                      // not connected yet, or a silent render quantum
+    }
+    if (input.length !== this.channels) {
+      this.resize(input.length);
+    }
+
+    const slot = this.write;
+    if (this.count === this.capacity) {
+      // The ring is full, so the slot about to be written is the oldest: subtract it first.
+      this.totalFrames -= this.frames[slot];
+      for (let c = 0; c < this.channels; c++) {
+        this.running[c] -= this.sumsq[c][slot];
+      }
+    } else {
+      this.count++;
+    }
+
+    const frames = input[0].length;
+    this.frames[slot] = frames;
+    this.totalFrames += frames;
+    for (let c = 0; c < this.channels; c++) {
+      const samples = input[c];
+      let sumsq = 0;
+      let peak = 0;
+      for (let i = 0; i < frames; i++) {
+        const sample = samples[i];
+        sumsq += sample * sample;
+        const magnitude = Math.abs(sample);
+        if (magnitude > peak) {
+          peak = magnitude;
+        }
+      }
+      this.sumsq[c][slot] = sumsq;
+      this.peak[c][slot] = peak;
+      this.running[c] += sumsq;
+    }
+    this.write = (slot + 1) % this.capacity;
+
+    // Window peak is a max over the ring, which cannot be maintained incrementally the way the sum
+    // can. Recomputing it only when posting keeps that off the audio thread's hot path.
+    this.framesSincePost += frames;
+    if (this.framesSincePost >= sampleRate / this.updateHz) {
+      this.framesSincePost = 0;
+      const rms = [];
+      const peaks = [];
+      for (let c = 0; c < this.channels; c++) {
+        let peak = 0;
+        const ring = this.peak[c];
+        for (let i = 0; i < this.count; i++) {
+          if (ring[i] > peak) {
+            peak = ring[i];
+          }
+        }
+        peaks.push(peak);
+        // Evicting blocks from the running sum leaves rounding residue, so a window of true digital
+        // silence would otherwise report something like -167 dBFS rather than nothing at all. The
+        // window peak settles that exactly: zero peak means every sample in the window was zero.
+        rms.push(peak === 0 ? 0 : Math.sqrt(Math.max(0, this.running[c]) / this.totalFrames));
+      }
+      this.port.postMessage({
+        rms,
+        peak: peaks,
+        windowFrames: this.totalFrames,
+        sampleRate,
+      });
+    }
+    return true;
+  }
+}
+
+registerProcessor("level-processor", LevelProcessor);
+`;
+
+const BAR_FLOOR = -80;
+
+const ui = {
+  device: document.getElementById("device"),
+  ec: document.getElementById("ec"),
+  ns: document.getElementById("ns"),
+  agc: document.getElementById("agc"),
+  window: document.getElementById("window"),
+  rate: document.getElementById("rate"),
+  toggle: document.getElementById("toggle"),
+  reset: document.getElementById("reset"),
+  status: document.getElementById("status"),
+  rows: document.getElementById("rows"),
+  settings: document.getElementById("settings"),
+};
+
+let context = null;
+let stream = null;
+let node = null;
+let silence = null;
+let maxRms = [];
+let maxPeak = [];
+
+function dbfs(amplitude) {
+  return amplitude > 0 ? 20 * Math.log10(amplitude) : -Infinity;
+}
+
+function formatDb(db) {
+  return db === -Infinity ? "−∞" : db.toFixed(1);
+}
+
+function setStatus(text, isError) {
+  ui.status.textContent = text;
+  ui.status.className = isError ? "error" : "";
+}
+
+// One row per channel, plus a summary row matching what the native tool reports: the loudest
+// channel, which is the number to compare when channel counts differ between browsers.
+function renderRows(rms, peak) {
+  const wanted = rms.length + 1;
+  while (ui.rows.rows.length > wanted) {
+    ui.rows.deleteRow(-1);
+  }
+  while (ui.rows.rows.length < wanted) {
+    const row = ui.rows.insertRow(-1);
+    row.innerHTML =
+      '<th></th><td class="n"></td><td class="n"></td><td class="n"></td><td class="n"></td>' +
+      '<td><div class="bar"><div></div></div></td>';
+  }
+
+  const loudest = rms.indexOf(Math.max(...rms));
+  for (let i = 0; i < wanted; i++) {
+    const isSummary = i === rms.length;
+    const c = isSummary ? loudest : i;
+    const row = ui.rows.rows[i];
+    row.cells[0].textContent = isSummary ? "loudest (ch " + c + ")" : "ch " + c;
+    row.cells[0].style.color = isSummary ? "#666" : "";
+    row.cells[1].textContent = formatDb(dbfs(rms[c]));
+    row.cells[2].textContent = formatDb(dbfs(peak[c]));
+    row.cells[3].textContent = formatDb(dbfs(maxRms[c]));
+    row.cells[4].textContent = formatDb(dbfs(maxPeak[c]));
+    const db = dbfs(rms[c]);
+    const fill = row.cells[5].firstChild.firstChild;
+    fill.style.width = Math.max(0, Math.min(100, ((db - BAR_FLOOR) / -BAR_FLOOR) * 100)) + "%";
+    fill.className = dbfs(peak[c]) > -1 ? "hot" : "";
+  }
+}
+
+function onLevels(data) {
+  for (let c = 0; c < data.rms.length; c++) {
+    if (!(maxRms[c] > data.rms[c])) {
+      maxRms[c] = data.rms[c];
+    }
+    if (!(maxPeak[c] > data.peak[c])) {
+      maxPeak[c] = data.peak[c];
+    }
+  }
+  renderRows(data.rms, data.peak);
+
+  const silent = data.peak.every((p) => p === 0);
+  setStatus(
+    "Capturing: " + data.rms.length + " ch at " + data.sampleRate + " Hz, window " +
+      (data.windowFrames / data.sampleRate).toFixed(2) + " s" +
+      (silent ? " — digital silence, every sample is exactly zero" : "")
+  );
+}
+
+// Worth showing verbatim: the same constraints produce different platform configurations across
+// browsers, and getSettings() is where that becomes visible. Firefox and Chrome report the
+// processing flags they applied; Safari reports fewer of them.
+function showSettings(track) {
+  const settings = track.getSettings();
+  const lines = ["label: " + track.label];
+  for (const key of Object.keys(settings).sort()) {
+    lines.push(key + ": " + JSON.stringify(settings[key]));
+  }
+  lines.push("AudioContext sampleRate: " + context.sampleRate);
+  ui.settings.textContent = lines.join("\n");
+}
+
+async function listDevices() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+    return;
+  }
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const selected = ui.device.value;
+  ui.device.textContent = "";
+  const dflt = document.createElement("option");
+  dflt.value = "";
+  dflt.textContent = "default";
+  ui.device.appendChild(dflt);
+  for (const device of devices) {
+    if (device.kind !== "audioinput") {
+      continue;
+    }
+    const option = document.createElement("option");
+    option.value = device.deviceId;
+    // Labels are empty until a capture has been permitted, in every browser.
+    option.textContent = device.label || "input " + device.deviceId.slice(0, 8);
+    ui.device.appendChild(option);
+  }
+  ui.device.value = selected;
+}
+
+async function start() {
+  const audio = {
+    echoCancellation: ui.ec.checked,
+    noiseSuppression: ui.ns.checked,
+    autoGainControl: ui.agc.checked,
+  };
+  if (ui.device.value) {
+    audio.deviceId = { exact: ui.device.value };
+  }
+
+  setStatus("Requesting the microphone…");
+  stream = await navigator.mediaDevices.getUserMedia({ audio });
+
+  // No sampleRate on the context: the point is to observe what the browser picks for this device.
+  context = new (window.AudioContext || window.webkitAudioContext)();
+  const url = URL.createObjectURL(new Blob([PROCESSOR_SOURCE], { type: "text/javascript" }));
+  try {
+    await context.audioWorklet.addModule(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  await context.resume();
+
+  const source = context.createMediaStreamSource(stream);
+  node = new AudioWorkletNode(context, "level-processor", {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+    processorOptions: {
+      windowSeconds: Number(ui.window.value),
+      updateHz: Number(ui.rate.value),
+    },
+  });
+  node.port.onmessage = (event) => onLevels(event.data);
+
+  // Rendering is driven by the destination, so a branch that does not reach it is not guaranteed to
+  // be pulled -- a worklet declared with no outputs stops being called in some browsers. Routing
+  // through a silent gain keeps the branch live everywhere. Nothing audible comes out of it either
+  // way: the processor never writes to its output, and the gain is zero, so echo cancellation has no
+  // loopback to chase.
+  silence = context.createGain();
+  silence.gain.value = 0;
+  source.connect(node);
+  node.connect(silence);
+  silence.connect(context.destination);
+
+  maxRms = [];
+  maxPeak = [];
+  ui.toggle.textContent = "Stop";
+  setStatus("Capturing…");
+  showSettings(stream.getAudioTracks()[0]);
+  await listDevices();
+}
+
+function stop() {
+  if (node) {
+    node.port.onmessage = null;
+    node.disconnect();
+    node = null;
+  }
+  if (silence) {
+    silence.disconnect();
+    silence = null;
+  }
+  if (stream) {
+    for (const track of stream.getTracks()) {
+      track.stop();
+    }
+    stream = null;
+  }
+  if (context) {
+    context.close();
+    context = null;
+  }
+  ui.toggle.textContent = "Start";
+  setStatus("Not capturing.");
+}
+
+ui.toggle.addEventListener("click", async () => {
+  if (stream) {
+    stop();
+    return;
+  }
+  ui.toggle.disabled = true;
+  try {
+    await start();
+  } catch (error) {
+    stop();
+    setStatus(error.name + ": " + error.message, true);
+  } finally {
+    ui.toggle.disabled = false;
+  }
+});
+
+ui.reset.addEventListener("click", () => {
+  maxRms = [];
+  maxPeak = [];
+});
+
+// The window and update rate are live: the worklet reallocates its ring rather than restarting
+// capture, so a comparison is not interrupted by changing them.
+ui.window.addEventListener("change", () => {
+  if (node) {
+    node.port.postMessage({ windowSeconds: Number(ui.window.value) });
+  }
+});
+ui.rate.addEventListener("change", () => {
+  if (node) {
+    node.port.postMessage({ updateHz: Number(ui.rate.value) });
+  }
+});
+
+// Changing the device or the processing constraints has to reopen the track.
+for (const control of [ui.device, ui.ec, ui.ns, ui.agc]) {
+  control.addEventListener("change", async () => {
+    if (!stream) {
+      return;
+    }
+    stop();
+    try {
+      await start();
+    } catch (error) {
+      stop();
+      setStatus(error.name + ": " + error.message, true);
+    }
+  });
+}
+
+listDevices();
+</script>
+</body>
+</html>

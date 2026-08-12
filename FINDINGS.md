@@ -193,6 +193,11 @@ Standard, so nothing unexpected is applied to either. Treat the picker as a curi
   progressively, which looks exactly like a settling loss.
 - A bare CLI tool's capture is attributed to the **terminal**, so anything the system scopes per app
   (TCC grants, mic modes) needs the app bundle and `open -a` with an absolute path.
+- Numbers from a browser and numbers from this tool are comparable only if they are the same
+  measurement. `web/mic-level-meter.html` reports RMS and peak dBFS per channel over the same kind of
+  sliding window, so a Firefox-versus-Safari comparison can be put beside a native one — but the
+  browser sees audio *after* platform and WebRTC processing, and its `getSettings()` output is the
+  only evidence of which of that was applied.
 - `/usr/bin/log` refuses to run sandboxed ("Cannot run while sandboxed"), and `log` is also a zsh
   builtin. WebKit's capture logging is on the `WebRTC` channel of subsystem `com.apple.WebKit`, not
   under `com.apple.coreaudio`; shipping Safari emits no VPIO *setup* logs at all.
