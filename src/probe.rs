@@ -15,6 +15,12 @@ use coreaudio_sys::*;
 
 use crate::meter::Meter;
 
+extern "C" {
+    /// Enables the device's voice activity detection and installs a muted-speech listener on the
+    /// unit, as WebKit's CoreAudioCaptureUnit does. In C because the listener is an ObjC block.
+    fn vpio_enable_voice_activity_detection(unit: AudioUnit, device: AudioDeviceID) -> OSStatus;
+}
+
 const AU_IN_BUS: AudioUnitElement = 1;
 const AU_OUT_BUS: AudioUnitElement = 0;
 // Renders bigger than this are dropped rather than allocating on the audio thread. The HAL asks for
@@ -31,6 +37,11 @@ pub enum ProbeKind {
     /// what WebKit does.
     Vpio {
         params: Option<u32>,
+        /// Enable voice activity detection and install the muted-speech listener, as WebKit does.
+        voice_activity: bool,
+        /// Configure other-audio ducking through the public property, as WebKit does, rather than
+        /// leaving it to cubeb's private audio_device_duck call.
+        ducking: bool,
         /// Set the unit's capture format to this rate, as WebKit does with the device's nominal
         /// rate. `None` leaves the format the unit advertises alone, imposing nothing.
         rate: Option<f64>,
@@ -127,6 +138,26 @@ impl InputProbe {
                 },
                 &device,
             )?;
+
+            if let ProbeKind::Vpio { ducking: true, .. } = kind {
+                let configuration = AUVoiceIOOtherAudioDuckingConfiguration {
+                    mEnableAdvancedDucking: 1,
+                    mDuckingLevel: kAUVoiceIOOtherAudioDuckingLevelMin
+                        as AUVoiceIOOtherAudioDuckingLevel,
+                };
+                // WebKit tolerates this property being unavailable, so do the same.
+                match set_prop(
+                    unit,
+                    kAUVoiceIOProperty_OtherAudioDuckingConfiguration,
+                    kAudioUnitScope_Global,
+                    AU_IN_BUS,
+                    &configuration,
+                ) {
+                    Ok(()) => {}
+                    Err(e) if e == kAudioUnitErr_InvalidProperty as OSStatus => {}
+                    Err(e) => return Err(e),
+                }
+            }
 
             match kind {
                 ProbeKind::Hal => {
@@ -241,6 +272,14 @@ impl InputProbe {
             unsafe { AudioComponentInstanceDispose(unit) };
             probe.unit = ptr::null_mut();
             return Err(e);
+        }
+
+        if let ProbeKind::Vpio {
+            voice_activity: true,
+            ..
+        } = kind
+        {
+            check(unsafe { vpio_enable_voice_activity_detection(unit, device) })?;
         }
 
         // Voice-processing params go on after initialization, which is where the unit's own

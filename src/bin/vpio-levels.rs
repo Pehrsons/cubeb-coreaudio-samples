@@ -22,6 +22,8 @@ use cubeb_coreaudio_samples::knobs;
 use cubeb_coreaudio_samples::meter::{fmt_dbfs, Meter, Report, Snapshot};
 use cubeb_coreaudio_samples::probe::{InputProbe, ProbeKind};
 use std::ffi::{c_char, c_void, CString};
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +31,9 @@ use std::{process, ptr, slice, thread};
 
 extern "C" {
     fn print_log(msg: *const c_char, ...);
+    /// Audio routing arbitration, which WebKit does and cubeb does not. See src/routing_arbiter.m.
+    fn routing_arbiter_begin_play_and_record() -> i32;
+    fn routing_arbiter_leave();
 }
 
 // Built with --features zeroing-alloc to test whether anything here depends on reading
@@ -227,6 +232,10 @@ struct Args {
     /// internal voice path engages.
     #[clap(long)]
     output_device: Option<String>,
+    /// Redirect everything this prints to a file. Needed when the run is started by launchd, e.g.
+    /// `open -a VpioLevels.app --args ...`, where stdout goes nowhere.
+    #[clap(long)]
+    log_file: Option<String>,
     /// List the input and output devices and exit.
     #[clap(long)]
     list_devices: bool,
@@ -251,6 +260,22 @@ fn main() {
         .after_help(scenario_listing(false))
         .get_matches();
     let args = Args::from_arg_matches(&args).unwrap_or_else(|e| e.exit());
+
+    // Point the process's own stdout and stderr at the file, so every println and every line cubeb
+    // prints from C lands there too.
+    if let Some(path) = &args.log_file {
+        match File::create(path) {
+            Ok(file) => {
+                let fd = file.as_raw_fd();
+                unsafe {
+                    libc::dup2(fd, libc::STDOUT_FILENO);
+                    libc::dup2(fd, libc::STDERR_FILENO);
+                }
+                std::mem::forget(file);
+            }
+            Err(e) => eprintln!("could not open {} for logging: {}", path, e),
+        }
+    }
     if args.list {
         print_help();
         return;
@@ -408,14 +433,17 @@ Steps, separated by ';':
                         Stop or restart a stream without destroying it. Processing params set
                         on a running stream only take effect on restart.
   params <name> <spec>  Set input processing params, e.g. `proc`, `none`, `aec+ns`.
-  native <name> hal|vpio [params] [rate=<hz>] [no-outio]
+  native <name> hal|vpio [params] [rate=<hz>] [no-outio] [vad] [duck]
                         Open a capture client set up natively, without cubeb. `vpio` instantiates a
                         VoiceProcessingIO unit directly, so its level can be compared with cubeb's;
                         without a params spec the unit keeps its own defaults, as WebKit leaves
                         them. `rate=` sets the unit's capture format rate the way WebKit configures
                         the mic proc, where omitting it imposes no format at all; note --rate only
                         applies to cubeb streams. `no-outio` disables IO on the output scope the way
-                        cubeb does for an input-only stream.
+                        cubeb does for an input-only stream. `vad` enables the device's voice
+                        activity detection and installs the muted-speech listener, and `duck`
+                        configures other-audio ducking through the public property -- both things
+                        WebKit does and cubeb does not.
   native off <name>     Close a native client.
   probe on|off|restart  Start/stop a plain non-cubeb CoreAudio capture client, or reopen it so
                         its channel count matches the device's current one (the built-in mic
@@ -426,6 +454,8 @@ Steps, separated by ';':
                         with that measurement and in the closing summary.
   volume <scalar|?>     Read, or set, the device's input volume (the system input slider). The
                         original value is restored when the run ends.
+  arbitration on|off    Begin or leave audio routing arbitration for the play-and-record category,
+                        which is what WebKit's AudioSessionMac does and cubeb never does.
   probevol <v> [bus]    Set the probe unit's own Volume parameter (kHALOutputParam_Volume), to
                         test whether that per-client knob affects capture. Bus 1 by default.
   cycle <n> [spec...]   Open and immediately close a stream n times, to churn VPIO units. Note
@@ -464,6 +494,7 @@ enum Step {
     Measure(Option<f64>),
     Note(String),
     Volume(Option<f32>),
+    Arbitration(bool),
     ProbeUnitVolume {
         value: f32,
         element: u32,
@@ -669,7 +700,10 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                         Some(&"hal") => ProbeKind::Hal,
                         Some(&"vpio") => ProbeKind::Vpio {
                             params: match tokens.get(3) {
-                                Some(spec) if !spec.starts_with("rate=") && *spec != "no-outio" => {
+                                Some(spec)
+                                    if !spec.starts_with("rate=")
+                                        && !["no-outio", "vad", "duck"].contains(spec) =>
+                                {
                                     Some(parse_params(spec).ok_or_else(|| {
                                         format!("Unknown params spec \"{}\"", spec)
                                     })?)
@@ -685,6 +719,8 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                                 None => None,
                             },
                             disable_output_io: tokens.iter().any(|t| *t == "no-outio"),
+                            voice_activity: tokens.iter().any(|t| *t == "vad"),
+                            ducking: tokens.iter().any(|t| *t == "duck"),
                         },
                         _ => return Err("`native <name>` needs `hal` or `vpio`".to_string()),
                     };
@@ -738,6 +774,11 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                 };
                 Step::ProbeUnitVolume { value, element }
             }
+            "arbitration" => match tokens.get(1) {
+                Some(&"on") => Step::Arbitration(true),
+                Some(&"off") => Step::Arbitration(false),
+                _ => return Err("`arbitration` needs `on` or `off`".to_string()),
+            },
             "volume" => match tokens.get(1) {
                 Some(&"?") | None => Step::Volume(None),
                 Some(value) => Step::Volume(Some(
@@ -994,6 +1035,24 @@ impl Runner {
             }
             Step::Note(text) => self.pending_note = Some(text),
             Step::Volume(scalar) => self.volume(scalar),
+            Step::Arbitration(on) => {
+                if on {
+                    let result = unsafe { routing_arbiter_begin_play_and_record() };
+                    println!(
+                        "[{:6.1}s] arbitration on: {}",
+                        self.elapsed(),
+                        match result {
+                            0 => "begun for the play-and-record category".to_string(),
+                            -1 => "AVAudioRoutingArbiter unavailable".to_string(),
+                            -3 => "timed out waiting for the completion handler".to_string(),
+                            e => format!("failed, error {}", e),
+                        }
+                    );
+                } else {
+                    unsafe { routing_arbiter_leave() };
+                    println!("[{:6.1}s] arbitration off", self.elapsed());
+                }
+            }
             Step::ProbeUnitVolume { value, element } => {
                 let result = match self.natives.iter().find(|n| n.name == "probe") {
                     Some(native) => native.probe.set_unit_volume(value, element),
@@ -1275,8 +1334,10 @@ impl Runner {
                 params,
                 rate,
                 disable_output_io,
+                voice_activity,
+                ducking,
             } => format!(
-                "native VPIO, no cubeb, params {}{}{}",
+                "native VPIO, no cubeb, params {}{}{}{}{}",
                 match params {
                     Some(p) => describe_params(p),
                     None => "left at the unit's defaults".to_string(),
@@ -1289,6 +1350,16 @@ impl Runner {
                     ", output IO disabled as cubeb does"
                 } else {
                     ", output IO untouched as WebKit does"
+                },
+                if voice_activity {
+                    ", voice activity detection on as WebKit does"
+                } else {
+                    ""
+                },
+                if ducking {
+                    ", ducking configured through the public property as WebKit does"
+                } else {
+                    ""
                 }
             ),
         };

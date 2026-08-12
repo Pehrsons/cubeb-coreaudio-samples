@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 bitflags = "2.5"
 debug_tree = "0.4"
+libc = "0.2"
 cubeb-backend = "0.34"
 cubeb-coreaudio = { git = "https://github.com/mozilla/cubeb-coreaudio-rs", rev = "840f69c1b3f95accd582555e10abcef8ee67514b", features = [
     "audio-dump",
