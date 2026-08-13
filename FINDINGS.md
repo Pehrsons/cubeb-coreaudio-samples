@@ -129,6 +129,60 @@ One thing this does not establish: `MediaSessionManagerCocoa`'s category calls a
 `AudioSession::shouldManageAudioSessionCategory()`, which defaults to false, so whether shipping
 Safari has the session configured this way during a getUserMedia capture is still unverified.
 
+### Safari's VPIO configuration, compared property by property
+
+VoiceProcessingIO logs its own internals on two `com.apple.coreaudio` channels — `auvp`
+(`AUVPAggregate.cpp`, the aggregate device, formats, taps, ducking) and `vp` (`vpStrategyManager.mm`,
+`VoiceProcessor_v6.cpp`, `vpDebug_Logging.cpp`, the DSP graph and its gains). Both are emitted by the
+*client* process, so the same capture shows Safari's unit and ours in identical terms, which makes the
+comparison that WebKit's own release logging never gave us:
+
+```
+/usr/bin/log stream --level debug --style compact \
+  --predicate 'process == "com.apple.WebKit.GPU" OR subsystem BEGINSWITH "com.apple.coreaudio" \
+               OR subsystem BEGINSWITH "com.apple.audio"'
+```
+
+A trace is only comparable if it caught a *setup*: check for `AUVoiceProcessor initialized` and
+`InitializeHWInput`. A trace with `auvp` lines, `AUVoiceProcessor destroyed` and no `Initialize*` is a
+teardown, which produces convincing but meaningless differences — quit Safari first so a fresh unit is
+built inside the window.
+
+**The DSP graph is identical.** Of 134 stages logged by `vpDebug_Logging.cpp`, exactly three differed
+between Safari and `native n vpio proc`, and every gain matched: `Pre-echo-processing Digital Input
+Gain -1.0 / 38.0 dB`, `Post-echo-processing Digital Input Gain 0.0 / 4.0 dB`, `Downlink Mix Gain
+-15.0 dB`, `(UL-)AGCV2 ON`, `(UL-)GateV3 ON`, `(UL)-PostGain ON`, and the same `aupreset`, `medc` and
+`spac` override presets on both sides. There is no per-app gain or tuning difference to find here.
+
+| stage | Safari | ours |
+| --- | --- | --- |
+| `(UL-)DNNVADGraph` | ON | OFF |
+| `(DL-)FEVDNNVADGraph` | ON | OFF |
+| `(DL-)DynDucker` | ON | ON (bypassed) — that run had no `duck` |
+
+The neural VAD is the one unexplained difference. It is *not* the voice activity detection WebKit's
+source points at: `vad` applies `kAudioDevicePropertyVoiceActivityDetectionEnable` plus the
+muted-speech listener successfully, and leaves all 134 stages unchanged. Nor is it rate or ducking —
+`proc vad duck rate=48000` did not turn it on either. What remains are two vp properties Safari sets
+and we do not, `ddvh` and `32772` (we set `32768` and `32769`; the other 21 match, including `oadc`
+once `duck` is on).
+
+Other differences the traces confirm, none of them gain:
+
+- Safari runs the processor at 48 kHz, we at 44.1 kHz: `VP uplink MaxNumOutputFrames 960` and
+  `downlink MaxFarEndVoiceFrames 1512` against `441` and `1236`. Safari also hits a mismatch we do not,
+  `960 (VP maxNumOutFrames = 960, AUHal maxFramesPerSlice = 512), currently 512`.
+- Ducking values differ even though the API call matches WebKit's `{true, Min}` exactly: Safari logs
+  `ducking level 0.6310, ramp 1.00` then `0.4467, ramp 0.18`; ours `0.1778, ramp 0.35` then `1.0000,
+  ramp 2.00`.
+- We set `bypass = 0` explicitly; Safari never sets bypass at all.
+- `dev-90 processing kind 0 -> [attempted:1, actual:1]` appears on both sides.
+
+**None of it moves the level.** Measured with speech in the room, bypassed, processed and a
+full-parity unit (`proc vad duck rate=48000`) side by side against a plain client: parity 33.5 dB and
+ours 33.0 dB above the probe early, 37.6 and 37.4 settled — a 0.1 to 0.5 dB difference, i.e. nothing.
+Bypass sat 41 dB above the probe, *louder* than processed, which is this M2 having no cliff.
+
 ### Safari captures in the GPU process
 
 Measured while Safari held the microphone, by walking `kAudioHardwarePropertyProcessObjectList` and
@@ -203,16 +257,25 @@ System_Input_Processing_Notification_Handler.mm:425  Setting supported voice iso
 bundle id com.apple.Safari: [AVAUVoiceIOChatFlavorStandard, AVAUVoiceIOChatFlavorVoiceIsolation]
 ```
 
-macOS *hides* Wide Spectrum from Safari explicitly. So the picker difference is Apple policy keyed on
-the application, not a consequence of anything either browser does to its audio unit, and no
-configuration change on our side would reproduce or remove it. Both browsers default to Standard
-anyway, so nothing unexpected is applied to either. The picker is not a symptom.
+macOS *hides* Wide Spectrum from that client explicitly. A later capture showed the same for the other
+two WebKit bundle IDs, so it is not specific to Safari's:
 
-Two caveats. Our own capture logged the `is_vi_available` verdict but neither list, which fits the
-lists being logged only when something is hidden, but the two captures were not matched runs, so that
-half is consistent rather than established. And note the bundle ID CoreAudio attributes is
-`com.apple.Safari` even though the unit lives in `com.apple.WebKit.GPU` — the policy follows the
-responsible application, not the process holding the unit.
+| bundle id | hidden | supported |
+| --- | --- | --- |
+| `com.apple.Safari` | `[WideSpectrum]` | `[Standard, VoiceIsolation]` |
+| `com.apple.WebKit.GPU` | `[WideSpectrum]` | `[]` |
+| `com.apple.WebKit.WebContent` | `[WideSpectrum]` | `[]` |
+
+So the picker difference is Apple policy keyed on the application, not a consequence of anything either
+browser does to its audio unit, and no configuration change on our side would reproduce or remove it.
+Whether that is a deny list containing the WebKit bundles or an allow list that Firefox is on is not
+established — only that it is decided by bundle ID before any audio configuration happens. Both
+browsers default to Standard anyway. The picker is not a symptom.
+
+Note also that the bundle ID CoreAudio attributes when Safari captures is `com.apple.Safari` even
+though the unit lives in `com.apple.WebKit.GPU`: the policy follows the responsible application. Our
+own captures logged the `is_vi_available` verdict but neither list, which fits the lists being logged
+only when something is hidden, though the runs were not matched.
 
 ## Reliability, separate from level
 
