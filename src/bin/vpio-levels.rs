@@ -528,6 +528,9 @@ Steps, separated by ';':
   measure [secs]        Capture for a while and report levels for everything live.
   sleep <secs>          Wait without reporting (e.g. past the 10s VPIO idle timeout).
   devinfo               Dump the input device's CoreAudio properties.
+  cubebdev              Ask cubeb what it reports for the input devices -- max_channels and rates,
+                        which is what a client such as Gecko reads when deciding what to request.
+                        Distinct from devinfo, which reads CoreAudio directly.
 ";
 
 #[derive(Debug)]
@@ -557,6 +560,7 @@ enum Step {
     Measure(Option<f64>),
     Note(String),
     Volume(Option<f32>),
+    CubebDev,
     Arbitration(bool),
     /// `Some(mode, activate)` configures the play-and-record category, `None` deactivates.
     Session(Option<(String, bool)>),
@@ -869,6 +873,7 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
             },
             "note" => Step::Note(tokens[1..].join(" ")),
             "devinfo" => Step::DevInfo,
+            "cubebdev" => Step::CubebDev,
             other => return Err(format!("Unknown step \"{}\"", other)),
         };
         steps.push(step);
@@ -1184,7 +1189,61 @@ impl Runner {
                 println!("[{:6.1}s] device state:\n{}", self.elapsed(), snapshot.describe());
                 self.last_device_snapshot = snapshot;
             }
+            Step::CubebDev => self.cubeb_devices(),
         }
+    }
+
+    /// What cubeb reports about the input devices, which is what a client such as Gecko sees when it
+    /// decides how many channels to ask for. Distinct from `devinfo`, which reads CoreAudio directly:
+    /// this is the backend's own answer, so it reflects whatever counting the backend does.
+    fn cubeb_devices(&self) {
+        let mut collection = cubeb_device_collection {
+            device: ptr::null_mut(),
+            count: 0,
+        };
+        let rv =
+            unsafe { cubeb_enumerate_devices(self.ctx, CUBEB_DEVICE_TYPE_INPUT, &mut collection) };
+        if rv != CUBEB_OK {
+            println!("[{:6.1}s] cubeb_enumerate_devices failed, rv {}", self.elapsed(), rv);
+            return;
+        }
+        println!("[{:6.1}s] cubeb input devices:", self.elapsed());
+        let devices = unsafe { slice::from_raw_parts(collection.device, collection.count) };
+        for info in devices {
+            let name = if info.friendly_name.is_null() {
+                "(unnamed)".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(info.friendly_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            // Mark the device under test, since that is the one the scenario is about.
+            let uid = if info.device_id.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(info.device_id) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let mine = device_uid(self.device).is_some_and(|d| d == uid);
+            println!(
+                "    {} {:<28} max_channels {}  default_rate {}  rate {}..{}  latency {}..{}{}",
+                if mine { "->" } else { "  " },
+                name,
+                info.max_channels,
+                info.default_rate,
+                info.min_rate,
+                info.max_rate,
+                info.latency_lo,
+                info.latency_hi,
+                if info.preferred != 0 {
+                    "  [preferred]"
+                } else {
+                    ""
+                }
+            );
+        }
+        unsafe { cubeb_device_collection_destroy(self.ctx, &mut collection) };
     }
 
     /// Churn VPIO units: open and immediately close a stream `count` times. Back-to-back cycles
